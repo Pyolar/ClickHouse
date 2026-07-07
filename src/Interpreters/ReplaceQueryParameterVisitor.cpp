@@ -15,8 +15,6 @@
 #include <Parsers/ASTSetQuery.h>
 #include <Parsers/ASTViewTargets.h>
 #include <Parsers/FieldFromAST.h>
-#include <Parsers/Access/ASTCreateUserQuery.h>
-#include <Parsers/Access/ASTUserNameWithHost.h>
 #include <Parsers/TablePropertiesQueriesASTs.h>
 #include <Analyzer/Utils.h>
 #include <Common/SettingsChanges.h>
@@ -54,15 +52,6 @@ void ReplaceQueryParameterVisitor::visit(ASTPtr & ast)
     {
         if (auto * describe_query = dynamic_cast<ASTDescribeQuery *>(ast.get()); describe_query && describe_query->table_expression)
             visitChildren(describe_query->table_expression);
-        else if (auto * create_user_query = dynamic_cast<ASTCreateUserQuery *>(ast.get()))
-        {
-            if (create_user_query->names)
-            {
-                ASTPtr names = create_user_query->names;
-                visitChildren(names);
-            }
-            visitChildren(ast);
-        }
         else if (auto * create_query = dynamic_cast<ASTCreateQuery *>(ast.get()))
         {
             if (create_query->isParameterizedView())
