@@ -556,7 +556,6 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::freeze(
         params.external_transaction);
 
 
-
     if (save_metadata_callback)
         save_metadata_callback(disk);
 
