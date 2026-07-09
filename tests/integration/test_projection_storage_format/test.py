@@ -406,3 +406,101 @@ def test_zero_copy_mutation_preserves_flat_projection():
         == baseline
     )
     assert check_table("t_zc", node2) == "1"
+def table_path(name, n=node):
+    return (
+        n.query(f"SELECT data_paths[1] FROM system.tables WHERE name = '{name}'")
+        .strip()
+        .rstrip("/")
+    )
+
+
+def plant_stale_tmp_dir(stale, n=node):
+    """Simulate leftovers of a failed operation: a stale temporary part dir plus its
+    flat projection sibling, both containing a marker file. chmod so the server
+    (clickhouse user) can remove root-created content."""
+    n.exec_in_container(
+        [
+            "bash",
+            "-c",
+            f"mkdir -p {stale} {stale}.p.proj"
+            f" && touch {stale}/stale_marker.txt {stale}.p.proj/stale_marker.txt"
+            f" && chmod -R 777 {stale} {stale}.p.proj",
+        ],
+        privileged=True,
+        user="root",
+    )
+
+
+# Issue #1 (removeRecursive): when an insert reuses the temporary directory name of a
+# previously failed insert, the collision cleanup in MergeTreeDataWriter wipes the stale
+# tmp_insert_<part> dir via removeRecursive - the stale flat sibling must die with it.
+# Otherwise the fresh projection is written into the leftover sibling directory and its
+# stale files are published under the live part name.
+# @pytest.mark.xfail(reason=REVIEW + "3544856348", strict=False)
+def test_stale_tmp_insert_sibling_removed():
+    node.query("DROP TABLE IF EXISTS t_ins SYNC")
+    node.query("SYSTEM STOP MERGES")
+    node.query(
+        """CREATE TABLE t_ins (key UInt64, id UInt64, value String,
+           PROJECTION p (SELECT key, id, value ORDER BY id))
+           ENGINE = MergeTree ORDER BY key
+           SETTINGS min_bytes_for_wide_part = 0, projection_storage_format = 'flat'"""
+    )
+    # the first insert into a fresh table writes through tmp_insert_all_1_1_0
+    stale = f"{table_path('t_ins')}/tmp_insert_all_1_1_0"
+    plant_stale_tmp_dir(stale)
+    node.query(
+        "INSERT INTO t_ins SELECT number, number * 2, toString(number) FROM numbers(1000)"
+    )
+    p = part_dir("t_ins")
+    assert p.endswith("all_1_1_0")  # the collision branch really ran
+    assert path_exists(f"{p}.p.proj")
+    # neither the part nor its projection may adopt files of the stale directories
+    assert not path_exists(f"{p}/stale_marker.txt")
+    assert not path_exists(f"{p}.p.proj/stale_marker.txt")
+    # no stale sibling left behind under the temporary name
+    assert not path_exists(f"{stale}.p.proj")
+    assert broken_projection_parts("t_ins") == "0"
+    assert (
+        proj_query("t_ins", extra_settings="force_optimize_projection = 1")
+        == "100\t4950"
+    )
+    assert check_table("t_ins") == "1"
+
+
+# Issue #1 (removeSharedRecursive): a retried fetch finds the tmp-fetch_<part> dir of a
+# previously failed fetch and wipes it via removeSharedRecursive - the stale flat sibling
+# must die with it. Otherwise the retried download materializes the projection into the
+# leftover sibling directory, mixing stale files into the fetched part.
+# @pytest.mark.xfail(reason=REVIEW + "3534142472", strict=False)
+def test_stale_tmp_fetch_sibling_removed():
+    for n, replica in ((node, "1"), (node2, "2")):
+        n.query("DROP TABLE IF EXISTS t_fetch SYNC")
+        n.query("SYSTEM STOP MERGES")
+        n.query(
+            f"""CREATE TABLE t_fetch (key UInt64, id UInt64, value String,
+                PROJECTION p (SELECT key, id, value ORDER BY id))
+                ENGINE = ReplicatedMergeTree('/clickhouse/tables/t_fetch', '{replica}')
+                ORDER BY key
+                SETTINGS min_bytes_for_wide_part = 0, projection_storage_format = 'flat'"""
+        )
+    node2.query("SYSTEM STOP FETCHES t_fetch")
+    node.query(
+        "INSERT INTO t_fetch SELECT number, number * 2, toString(number) FROM numbers(1000)"
+    )
+    name = part_name("t_fetch", node)
+    stale = f"{table_path('t_fetch', node2)}/tmp-fetch_{name}"
+    plant_stale_tmp_dir(stale, node2)
+    node2.query("SYSTEM START FETCHES t_fetch")
+    node2.query("SYSTEM SYNC REPLICA t_fetch")
+    p2 = part_dir("t_fetch", node2)
+    assert path_exists(f"{p2}.p.proj", node2)
+    # the fetched part must not adopt files of the stale directories
+    assert not path_exists(f"{p2}/stale_marker.txt", node2)
+    assert not path_exists(f"{p2}.p.proj/stale_marker.txt", node2)
+    assert not path_exists(f"{stale}.p.proj", node2)
+    assert broken_projection_parts("t_fetch", node2) == "0"
+    assert proj_query(
+        "t_fetch", node2, extra_settings="force_optimize_projection = 1"
+    ) == proj_query("t_fetch", node)
+    assert check_table("t_fetch", node2) == "1"

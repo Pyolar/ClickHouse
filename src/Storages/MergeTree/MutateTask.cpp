@@ -2251,7 +2251,7 @@ private:
         }
 
         /// Hardlink unchanged projections (layout-independent discovery: nested children or flat siblings)
-        for (auto proj = ctx->source_part->getDataPartStorage().iterateProjections(/*include_temp=*/ false); proj->isValid(); proj->next())
+        for (auto proj = ctx->source_part->getDataPartStorage().iterateProjections(false); proj->isValid(); proj->next())
         {
             if (!entries_to_hardlink.contains(proj->name()))
                 continue;
@@ -2552,7 +2552,7 @@ private:
         }
 
         /// Hardlink unchanged projections (layout-independent discovery: nested children or flat siblings)
-        for (auto proj = ctx->source_part->getDataPartStorage().iterateProjections(/*include_temp=*/ false); proj->isValid(); proj->next())
+        for (auto proj = ctx->source_part->getDataPartStorage().iterateProjections(false); proj->isValid(); proj->next())
         {
             const String projection_dir = proj->name();
             if (ctx->files_to_skip.contains(projection_dir))

@@ -525,6 +525,23 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::freeze(
     else
         disk->createDirectories(to);
 
+    /// LEGACY_NESTED projections are copied with the main part; FLAT projections should be handled separately
+    for (auto proj = iterateProjections(false); proj->isValid(); proj->next())
+    {
+        if (proj->format() == ProjectionStorageFormat::FLAT)
+            Backup(
+                disk,
+                disk,
+                fs::path(proj->rootPath()) / proj->realName(),
+                fs::path(to) / (dir_path + "." + proj->name()),
+                read_settings,
+                write_settings,
+                params.make_source_readonly,
+                {},
+                params.copy_instead_of_hardlink,
+                params.files_to_copy_instead_of_hardlinks,
+                params.external_transaction);
+    }
     Backup(
         disk,
         disk,
@@ -533,30 +550,12 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::freeze(
         read_settings,
         write_settings,
         params.make_source_readonly,
-        /* max_level= */ {},
+        {},
         params.copy_instead_of_hardlink,
         params.files_to_copy_instead_of_hardlinks,
         params.external_transaction);
 
-    /// Nested projections are inside the part dir and copied above; FLAT projection siblings live next to
-    /// it, so copy each to the matching sibling of the destination.
-    for (auto proj = iterateProjections(/*include_temp=*/ false); proj->isValid(); proj->next())
-    {
-        if (proj->format() != ProjectionStorageFormat::FLAT)
-            continue;
-        Backup(
-            disk,
-            disk,
-            fs::path(proj->rootPath()) / proj->realName(),
-            fs::path(to) / (dir_path + "." + proj->name()),
-            read_settings,
-            write_settings,
-            params.make_source_readonly,
-            /* max_level= */ {},
-            params.copy_instead_of_hardlink,
-            params.files_to_copy_instead_of_hardlinks,
-            params.external_transaction);
-    }
+
 
     if (save_metadata_callback)
         save_metadata_callback(disk);
@@ -607,6 +606,23 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::freezeRemote(
     else
         dst_disk->createDirectories(to);
 
+    /// LEGACY_NESTED projections are copied with the main part; FLAT projections should be handled separately
+    for (auto proj = iterateProjections(false); proj->isValid(); proj->next())
+    {
+        if (proj->format() == ProjectionStorageFormat::FLAT)
+            Backup(
+                src_disk,
+                dst_disk,
+                fs::path(proj->rootPath()) / proj->realName(),
+                fs::path(to) / (dir_path + "." + proj->name()),
+                read_settings,
+                write_settings,
+                params.make_source_readonly,
+                {},
+                true,
+                {},
+                params.external_transaction);
+    }
     /// freezeRemote() using copy instead of hardlinks for all files
     /// In this case, files_to_copy_intead_of_hardlinks is set by empty
     Backup(
@@ -617,30 +633,10 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::freezeRemote(
         read_settings,
         write_settings,
         params.make_source_readonly,
-        /* max_level= */ {},
+        {},
         true,
-        /* files_to_copy_intead_of_hardlinks= */ {},
+        {},
         params.external_transaction);
-
-    /// Nested projections are inside the part dir and copied above; FLAT projection siblings live next to
-    /// it, so copy each to the matching sibling of the destination.
-    for (auto proj = iterateProjections(/*include_temp=*/ false); proj->isValid(); proj->next())
-    {
-        if (proj->format() != ProjectionStorageFormat::FLAT)
-            continue;
-        Backup(
-            src_disk,
-            dst_disk,
-            fs::path(proj->rootPath()) / proj->realName(),
-            fs::path(to) / (dir_path + "." + proj->name()),
-            read_settings,
-            write_settings,
-            params.make_source_readonly,
-            /* max_level= */ {},
-            true,
-            /* files_to_copy_intead_of_hardlinks= */ {},
-            params.external_transaction);
-    }
 
     /// The save_metadata_callback function acts on the target dist.
     if (save_metadata_callback)
@@ -696,25 +692,28 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::clonePart(
                         dir_path, getRelativePath(), path_to_clone, fullPath(dst_disk, path_to_clone));
     }
 
-    /// Nested projections are inside the part dir and copied with it; FLAT projection siblings live next to
-    /// it, so copy each to the matching sibling of the destination.
+    /// LEGACY_NESTED projections are copied with the main part; FLAT projections should be handled separately
     std::vector<std::pair<String, String>> flat_projection_copies;
-    for (auto proj = iterateProjections(/*include_temp=*/ false); proj->isValid(); proj->next())
+    for (auto proj = iterateProjections(false); proj->isValid(); proj->next())
     {
-        if (proj->format() != ProjectionStorageFormat::FLAT)
-            continue;
-        String proj_from = fs::path(proj->rootPath()) / proj->realName();
-        String proj_to = fs::path(to) / (dir_path + "." + proj->name());
-        flat_projection_copies.emplace_back(std::move(proj_from), std::move(proj_to));
+        if (proj->format() == ProjectionStorageFormat::FLAT)
+        {
+            String proj_from = fs::path(proj->rootPath()) / proj->realName();
+            String proj_to = fs::path(to) / (dir_path + "." + proj->name());
+            flat_projection_copies.emplace_back(std::move(proj_from), std::move(proj_to));
+        }
     }
 
     try
     {
         dst_disk->createDirectories(to);
+        for (const auto & [proj_from, proj_to] : flat_projection_copies)
+        {
+            dst_disk->createDirectories(proj_to);
+            src_disk->copyDirectoryContent(proj_from, dst_disk, proj_to, read_settings, write_settings, cancellation_hook);
+        }
         src_disk->copyDirectoryContent(getRelativePath(), dst_disk, path_to_clone, read_settings, write_settings, cancellation_hook);
 
-        for (const auto & [proj_from, proj_to] : flat_projection_copies)
-            src_disk->copyDirectoryContent(proj_from, dst_disk, proj_to, read_settings, write_settings, cancellation_hook);
     }
     catch (...)
     {
@@ -776,26 +775,26 @@ void DataPartStorageOnDiskBase::rename(
 
     String from = getRelativePath();
 
-    /// Relocate FLAT projection siblings (nested ones move with the part dir). Layout is detected per
-    /// projection by iterateProjections, so this needs no configured format.
+    /// LEGACY_NESTED projections are copied with the main part; FLAT projections should be handled separately
     std::vector<std::pair<String, String>> flat_projection_moves;
-    for (auto proj = iterateProjections(/*include_temp=*/ false); proj->isValid(); proj->next())
+    for (auto proj = iterateProjections(false); proj->isValid(); proj->next())
     {
-        if (proj->format() != ProjectionStorageFormat::FLAT)
-            continue;
-        String proj_from = fs::path(proj->rootPath()) / proj->realName();
-        String proj_to = fs::path(new_root_path) / (new_part_dir + "." + proj->name());
-        flat_projection_moves.emplace_back(std::move(proj_from), std::move(proj_to));
+        if (proj->format() == ProjectionStorageFormat::FLAT)
+        {
+            String proj_from = fs::path(proj->rootPath()) / proj->realName();
+            String proj_to = fs::path(new_root_path) / (new_part_dir + "." + proj->name());
+            flat_projection_moves.emplace_back(std::move(proj_from), std::move(proj_to));
+        }
     }
 
     /// Why?
     executeWriteOperation([&](auto & disk)
     {
         disk.setLastModified(from, Poco::Timestamp::fromEpochTime(time(nullptr)));
-        disk.moveDirectory(from, to);
 
         for (const auto & [proj_from, proj_to] : flat_projection_moves)
             disk.moveDirectory(proj_from, proj_to);
+        disk.moveDirectory(from, to);
 
         /// Only after moveDirectory() since before the directory does not exist.
         SyncGuardPtr to_sync_guard;
@@ -1308,12 +1307,22 @@ std::unique_ptr<WriteBufferFromFileBase> DataPartStorageOnDiskBase::writeTransac
 
 void DataPartStorageOnDiskBase::removeRecursive()
 {
-    executeWriteOperation([&](auto & disk) { disk.removeRecursive(fs::path(root_path) / part_dir); });
+    executeWriteOperation([&](auto & disk)
+    {
+        for (auto proj = iterateProjections(true); proj->isValid(); proj->next())
+            disk.removeRecursive(fs::path(proj->rootPath()) / proj->realName());
+        disk.removeRecursive(fs::path(root_path) / part_dir);
+    });
 }
 
 void DataPartStorageOnDiskBase::removeSharedRecursive(bool keep_in_remote_fs)
 {
-    executeWriteOperation([&](auto & disk) { disk.removeSharedRecursive(fs::path(root_path) / part_dir, keep_in_remote_fs, {}); });
+    executeWriteOperation([&](auto & disk)
+    {
+        for (auto proj = iterateProjections(true); proj->isValid(); proj->next())
+            disk.removeSharedRecursive(fs::path(proj->rootPath()) / proj->realName(), keep_in_remote_fs, {});
+        disk.removeSharedRecursive(fs::path(root_path) / part_dir, keep_in_remote_fs, {});
+    });
 }
 
 void DataPartStorageOnDiskBase::createDirectories()

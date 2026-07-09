@@ -322,7 +322,7 @@ static IMergeTreeDataPart::Checksums checkDataPart(
     /// siblings of it, so collect them across both layouts, by their logical names.
     NameSet projections_on_disk;
     if (!data_part->isProjectionPart())
-        for (auto proj = data_part_storage.iterateProjections(/*include_temp=*/ false); proj->isValid(); proj->next())
+        for (auto proj = data_part_storage.iterateProjections(false); proj->isValid(); proj->next())
             projections_on_disk.insert(proj->name());
 
     const auto & checksums_txt_files = checksums_txt.files;
