@@ -24,6 +24,13 @@ public:
 
     DataPartProjectionIteratorPtr iterateProjections(bool include_temp) const override;
 
+    ProjectionStorageFormat getProjectionStorageFormat() const override { return projection_storage_format; }
+    void setProjectionStorageFormat(ProjectionStorageFormat format) override
+    {
+        chassert(format != ProjectionStorageFormat::NONE);
+        projection_storage_format = format;
+    }
+
     std::string getFullPath() const override;
     std::string getRelativePath() const override;
     std::string getPartDirectory() const override;
@@ -246,6 +253,9 @@ protected:
     std::string part_dir;
     DiskTransactionPtr transaction;
     bool has_shared_transaction = false;
+
+    /// Layout for projection directories created through this storage.
+    ProjectionStorageFormat projection_storage_format = ProjectionStorageFormat::NONE;
 
     /// Cached probe state for skp_idx.packed. probed=false means we haven't checked the disk yet;
     /// probed=true with reader=null means we checked and the archive isn't present.

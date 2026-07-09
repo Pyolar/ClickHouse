@@ -86,34 +86,49 @@ bool DataPartStorageOnDiskFull::hasProjection(const std::string & name) const
     return detectProjectionAndItsFormat(name) != ProjectionStorageFormat::NONE;
 }
 
-MutableDataPartStoragePtr DataPartStorageOnDiskFull::getProjection( // NOLINT
-    const std::string & name, bool use_parent_transaction, ProjectionStorageFormat creation_hint)
+MutableDataPartStoragePtr DataPartStorageOnDiskFull::getProjection(const std::string & name, bool use_parent_transaction) // NOLINT
 {
-    /// Detect the layout from disk; if the projection doesn't exist yet, the caller is about to create
-    /// it, so use the requested layout.
+    /// Detect the layout from disk; if doesn't exist - use configured layout
     ProjectionStorageFormat format = detectProjectionAndItsFormat(name);
     if (format == ProjectionStorageFormat::NONE)
-        format = creation_hint;
+    {
+        format = getProjectionStorageFormat();
+        if (format == ProjectionStorageFormat::NONE)
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "Cannot choose a layout for projection {} in part {}: storage has no projection storage format configured",
+                name, getRelativePath());
+    }
 
     auto [proj_root, proj_dir] = getProjectionStorageRootAndDir(root_path, part_dir, name, format);
-    return std::shared_ptr<DataPartStorageOnDiskFull>(new DataPartStorageOnDiskFull(
+    auto projection_storage = std::shared_ptr<DataPartStorageOnDiskFull>(new DataPartStorageOnDiskFull(
         volume,
         std::move(proj_root),
         std::move(proj_dir),
         use_parent_transaction ? transaction : nullptr));
+    /// copy parent's projection format
+    projection_storage->projection_storage_format = projection_storage_format;
+    return projection_storage;
 }
 
-DataPartStoragePtr DataPartStorageOnDiskFull::getProjection(const std::string & name, ProjectionStorageFormat creation_hint) const
+DataPartStoragePtr DataPartStorageOnDiskFull::getProjection(const std::string & name) const
 {
     ProjectionStorageFormat format = detectProjectionAndItsFormat(name);
     if (format == ProjectionStorageFormat::NONE)
-        format = creation_hint;
+    {
+        format = getProjectionStorageFormat();
+        if (format == ProjectionStorageFormat::NONE)
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "Cannot choose a layout for projection {} in part {}: storage has no projection storage format configured",
+                name, getRelativePath());
+    }
 
     auto [proj_root, proj_dir] = getProjectionStorageRootAndDir(root_path, part_dir, name, format);
-    return std::make_shared<DataPartStorageOnDiskFull>(
+    auto projection_storage = std::make_shared<DataPartStorageOnDiskFull>(
         volume,
         std::move(proj_root),
         std::move(proj_dir));
+    projection_storage->projection_storage_format = projection_storage_format;
+    return projection_storage;
 }
 
 bool DataPartStorageOnDiskFull::exists() const
@@ -299,8 +314,13 @@ void DataPartStorageOnDiskFull::copyFileFrom(const IDataPartStorage & source, co
         getReadSettings());
 }
 
-void DataPartStorageOnDiskFull::createProjection(const std::string & name, ProjectionStorageFormat format)
+void DataPartStorageOnDiskFull::createProjection(const std::string & name)
 {
+    const auto format = getProjectionStorageFormat();
+    if (format == ProjectionStorageFormat::NONE)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "Cannot create projection {} in part {}: storage has no projection storage format configured",
+            name, getRelativePath());
     const auto [proj_root, proj_dir] = getProjectionStorageRootAndDir(root_path, part_dir, name, format);
     executeWriteOperation([&](auto & disk) { disk.createDirectory(fs::path(proj_root) / proj_dir); });
 }

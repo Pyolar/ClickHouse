@@ -588,9 +588,8 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::prepare() const
     std::optional<MergeTreeDataPartBuilder> builder;
     if (global_ctx->parent_part)
     {
-        /// The merged projection dir doesn't exist yet, so pass the table's layout as the creation hint.
         auto data_part_storage = global_ctx->parent_part->getDataPartStorage().getProjection(
-            local_tmp_part_basename, /* use parent transaction */ false, global_ctx->parent_part->getProjectionStorageFormat());
+            local_tmp_part_basename, false);
         builder.emplace(*global_ctx->data, global_ctx->future_part->name, data_part_storage, getReadSettings());
         builder->withParentPart(global_ctx->parent_part);
     }

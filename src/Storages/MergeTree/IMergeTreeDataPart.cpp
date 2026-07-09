@@ -1373,19 +1373,11 @@ void IMergeTreeDataPart::loadColumnsChecksumsIndexes(bool require_columns_checks
     }
 }
 
-IDataPartStorage::ProjectionStorageFormat IMergeTreeDataPart::getProjectionStorageFormat() const
-{
-    return storage.getProjectionStorageFormat();
-}
-
 MergeTreeDataPartBuilder IMergeTreeDataPart::getProjectionPartBuilder(
     const String & projection_name, ProjectionDescriptionRawPtr projection, bool is_temp_projection)
 {
     const char * projection_extension = is_temp_projection ? ".tmp_proj" : ".proj";
-    /// The layout is detected from disk for existing projections; the hint only applies when the
-    /// directory will be created (fresh insert / fetch / materialize), in which case use the table setting.
-    auto projection_storage = getDataPartStorage().getProjection(
-        projection_name + projection_extension, !is_temp_projection, getProjectionStorageFormat());
+    auto projection_storage = getDataPartStorage().getProjection(projection_name + projection_extension, !is_temp_projection);
     MergeTreeDataPartBuilder builder(storage, projection_name, projection_storage, getReadSettings());
     return builder.withPartInfo(MergeListElement::FAKE_RESULT_PART_FOR_PROJECTION).withParentPart(this).withProjection(projection);
 }
