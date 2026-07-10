@@ -426,7 +426,13 @@ namespace
     }
 
 
-    bool parseRoles(IParserBase::Pos & pos, Expected & expected, bool default_roles, bool id_mode, boost::intrusive_ptr<ASTRolesOrUsersSet> & roles)
+    bool parseRoles(
+        IParserBase::Pos & pos,
+        Expected & expected,
+        bool default_roles,
+        bool id_mode,
+        bool allow_query_parameter,
+        boost::intrusive_ptr<ASTRolesOrUsersSet> & roles)
     {
         return IParserBase::wrapParseImpl(pos, [&]
         {
@@ -434,7 +440,7 @@ namespace
                 return false;
 
             ParserRolesOrUsersSet roles_p;
-            roles_p.allowRoles().useIDMode(id_mode);
+            roles_p.allowRoles().useIDMode(id_mode).allowQueryParameters(allow_query_parameter);
             if (default_roles)
                 roles_p.allowAll();
 
@@ -478,7 +484,8 @@ namespace
         });
     }
 
-    bool parseGrantees(IParserBase::Pos & pos, Expected & expected, bool id_mode, boost::intrusive_ptr<ASTRolesOrUsersSet> & grantees)
+    bool parseGrantees(
+        IParserBase::Pos & pos, Expected & expected, bool id_mode, bool allow_query_parameter, boost::intrusive_ptr<ASTRolesOrUsersSet> & grantees)
     {
         return IParserBase::wrapParseImpl(pos, [&]
         {
@@ -487,7 +494,7 @@ namespace
 
             ASTPtr ast;
             ParserRolesOrUsersSet grantees_p;
-            grantees_p.allowAny().allowUsers().allowCurrentUser().allowRoles().useIDMode(id_mode);
+            grantees_p.allowAny().allowUsers().allowCurrentUser().allowRoles().useIDMode(id_mode).allowQueryParameters(allow_query_parameter);
             if (!grantees_p.parse(pos, ast, expected))
                 return false;
 
@@ -663,16 +670,16 @@ bool ParserCreateUserQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expec
             }
         }
 
-        if (!roles && !alter && !attach_mode && parseRoles(pos, expected, /* default_roles = */ false, attach_mode, roles))
+        if (!roles && !alter && !attach_mode && parseRoles(pos, expected, /* default_roles = */ false, attach_mode, /* allow_query_parameter = */ !attach_mode, roles))
             continue;
 
-        if (!default_roles && parseRoles(pos, expected, /* default_roles = */ true, attach_mode, default_roles))
+        if (!default_roles && parseRoles(pos, expected, /* default_roles = */ true, attach_mode, /* allow_query_parameter = */ !attach_mode, default_roles))
             continue;
 
         if (cluster.empty() && parseOnCluster(pos, expected, cluster))
             continue;
 
-        if (!grantees && parseGrantees(pos, expected, attach_mode, grantees))
+        if (!grantees && parseGrantees(pos, expected, attach_mode, /* allow_query_parameter = */ !attach_mode, grantees))
             continue;
 
         if (!default_database && parseDefaultDatabase(pos, expected, default_database))
@@ -757,6 +764,15 @@ bool ParserCreateUserQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expec
 
     if (query->names)
         query->children.push_back(query->names);
+
+    if (query->roles)
+        query->children.push_back(query->roles);
+
+    if (query->default_roles)
+        query->children.push_back(query->default_roles);
+
+    if (query->grantees)
+        query->children.push_back(query->grantees);
 
     for (const auto & authentication_method : query->authentication_methods)
     {

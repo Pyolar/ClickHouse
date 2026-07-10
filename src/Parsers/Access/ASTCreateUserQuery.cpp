@@ -195,16 +195,25 @@ ASTPtr ASTCreateUserQuery::clone() const
     }
 
     if (roles)
+    {
         res->roles = boost::static_pointer_cast<ASTRolesOrUsersSet>(roles->clone());
+        res->children.push_back(res->roles);
+    }
 
     if (default_roles)
+    {
         res->default_roles = boost::static_pointer_cast<ASTRolesOrUsersSet>(default_roles->clone());
+        res->children.push_back(res->default_roles);
+    }
 
     if (default_database)
         res->default_database = boost::static_pointer_cast<ASTDatabaseOrNone>(default_database->clone());
 
     if (grantees)
+    {
         res->grantees = boost::static_pointer_cast<ASTRolesOrUsersSet>(grantees->clone());
+        res->children.push_back(res->grantees);
+    }
 
     if (settings)
         res->settings = boost::static_pointer_cast<ASTSettingsProfileElements>(settings->clone());

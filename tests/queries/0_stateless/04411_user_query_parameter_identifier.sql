@@ -50,8 +50,17 @@ CREATE USER {CLICKHOUSE_DATABASE:Identifier};
 CREATE ROLE {CLICKHOUSE_DATABASE_1:Identifier};
 GRANT {CLICKHOUSE_DATABASE_1:Identifier} TO {CLICKHOUSE_DATABASE:Identifier};
 SELECT count() FROM system.role_grants WHERE user_name = currentDatabase() AND granted_role_name = currentDatabase() || '_1';
+
+-- ... and in the DEFAULT ROLE / GRANTEES clauses of CREATE / ALTER USER.
+ALTER USER {CLICKHOUSE_DATABASE:Identifier} DEFAULT ROLE {CLICKHOUSE_DATABASE_1:Identifier};
+SELECT count() FROM system.users WHERE name = currentDatabase() AND has(default_roles_list, currentDatabase() || '_1');
+ALTER USER {CLICKHOUSE_DATABASE:Identifier} GRANTEES {CLICKHOUSE_DATABASE_1:Identifier};
+SELECT count() FROM system.users WHERE name = currentDatabase() AND has(grantees_list, currentDatabase() || '_1');
 REVOKE {CLICKHOUSE_DATABASE_1:Identifier} FROM {CLICKHOUSE_DATABASE:Identifier};
 SELECT count() FROM system.role_grants WHERE user_name = currentDatabase() AND granted_role_name = currentDatabase() || '_1';
+DROP USER {CLICKHOUSE_DATABASE:Identifier};
+CREATE USER {CLICKHOUSE_DATABASE:Identifier} DEFAULT ROLE {CLICKHOUSE_DATABASE_1:Identifier};
+SELECT count() FROM system.users WHERE name = currentDatabase() AND has(default_roles_list, currentDatabase() || '_1');
 DROP USER {CLICKHOUSE_DATABASE:Identifier};
 DROP ROLE {CLICKHOUSE_DATABASE_1:Identifier};
 
