@@ -16,6 +16,16 @@
                     </main>
                 </volumes>
             </s3>
+            <default_and_s3>
+                <volumes>
+                    <main>
+                        <disk>default</disk>
+                    </main>
+                    <external>
+                        <disk>s3</disk>
+                    </external>
+                </volumes>
+            </default_and_s3>
         </policies>
     </storage_configuration>
 </clickhouse>

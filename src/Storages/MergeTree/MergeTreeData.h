@@ -998,6 +998,11 @@ public:
     /// interrupted multi-directory operations). Safe only while no renames are in flight (startup).
     size_t clearOrphanProjectionSiblings();
 
+    /// Removes FLAT projection siblings of a removed detached part. `keep_shared` must be the
+    /// value returned by removeDetachedPart for the owner: the owner's zero-copy lock covers
+    /// the projection blobs as well.
+    void removeDetachedProjectionSiblings(const DiskPtr & disk, const String & dir_name, bool keep_shared);
+
     size_t clearEmptyParts();
 
     /// Moves to outdated state patch parts that do not need to be applied to regular parts.

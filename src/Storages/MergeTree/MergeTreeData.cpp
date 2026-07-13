@@ -3460,32 +3460,38 @@ size_t MergeTreeData::clearOrphanProjectionSiblings()
 
     for (const auto & disk : getDisks())
     {
-        if (disk->isBroken() || !disk->existsDirectory(relative_data_path))
+        if (disk->isBroken())
             continue;
 
-        Strings orphans;
-        for (auto it = disk->iterateDirectory(relative_data_path); it->isValid(); it->next())
+        for (const auto & root : {fs::path(relative_data_path), fs::path(relative_data_path) / DETACHED_DIR_NAME})
         {
-            const String entry = it->name();
-            if (!endsWith(entry, ".proj") && !endsWith(entry, ".tmp_proj"))
+            if (!disk->existsDirectory(root))
                 continue;
 
-            /// Part dir names contain no dots, so everything before the first one is the owner part dir.
-            const String owner = entry.substr(0, entry.find('.'));
-            if (owner.empty() || disk->existsDirectory(fs::path(relative_data_path) / owner))
-                continue;
+            Strings orphans;
+            for (auto it = disk->iterateDirectory(root); it->isValid(); it->next())
+            {
+                const String entry = it->name();
+                if (!endsWith(entry, ".proj") && !endsWith(entry, ".tmp_proj"))
+                    continue;
 
-            orphans.push_back(entry);
-        }
+                /// Part dir names contain no dots, so everything before the first one is the owner part dir.
+                const String owner = entry.substr(0, entry.find('.'));
+                if (owner.empty() || disk->existsDirectory(root / owner))
+                    continue;
 
-        for (const auto & entry : orphans)
-        {
-            LOG_WARNING(log, "Removing orphan projection directory {} whose part directory {} does not exist",
-                fullPath(disk, fs::path(relative_data_path) / entry), entry.substr(0, entry.find('.')));
+                orphans.push_back(entry);
+            }
 
-            /// Do not remove blobs if they exist
-            disk->removeSharedRecursive(fs::path(relative_data_path) / entry / "", true, {});
-            ++cleared_count;
+            for (const auto & entry : orphans)
+            {
+                LOG_WARNING(log, "Removing orphan projection directory {} whose part directory {} does not exist",
+                    fullPath(disk, root / entry), entry.substr(0, entry.find('.')));
+
+                /// Do not remove blobs if they exist
+                disk->removeSharedRecursive(root / entry / "", true, {});
+                ++cleared_count;
+            }
         }
     }
 
@@ -4352,6 +4358,7 @@ void MergeTreeData::dropAllData()
         try
         {
             bool keep_shared = removeDetachedPart(part.disk, fs::path(relative_data_path) / DETACHED_DIR_NAME / part.dir_name / "", part.dir_name);
+            removeDetachedProjectionSiblings(part.disk, part.dir_name, keep_shared);
             LOG_DEBUG(log, "dropAllData: Dropped detached part {}, keep shared data: {}", part.dir_name, keep_shared);
         }
         catch (...)
@@ -8550,9 +8557,27 @@ DetachedPartsInfo MergeTreeData::getDetachedParts() const
         /// Note: we don't care about TOCTOU issue here.
         if (disk->existsDirectory(detached_path))
         {
+            /// FLAT projection siblings are folded into their owner entry instead of being
+            /// listed as detached parts of their own.
+            std::unordered_map<String, size_t> index_by_dir_name;
+            Strings sibling_names;
             for (auto it = disk->iterateDirectory(detached_path); it->isValid(); it->next())
             {
+                if (endsWith(it->name(), ".proj") || endsWith(it->name(), ".tmp_proj"))
+                {
+                    sibling_names.push_back(it->name());
+                    continue;
+                }
+                index_by_dir_name[it->name()] = res.size();
                 res.push_back(DetachedPartInfo::parseDetachedPartName(disk, it->name(), format_version));
+            }
+            for (const auto & sibling : sibling_names)
+            {
+                /// Detached dir names contain no dots, so everything before the first one is the owner.
+                auto owner = index_by_dir_name.find(sibling.substr(0, sibling.find('.')));
+                /// An orphan sibling (owner gone) stays unlisted; clearOrphanProjectionSiblings reaps it.
+                if (owner != index_by_dir_name.end())
+                    res[owner->second].projection_siblings.push_back(sibling);
             }
         }
     }
@@ -8603,6 +8628,9 @@ void MergeTreeData::dropDetached(const ASTPtr & partition, bool part, ContextPtr
     for (auto & [_, old_dir, new_dir, disk] : renamed_parts.old_and_new_names)
     {
         bool keep_shared = removeDetachedPart(disk, fs::path(relative_data_path) / DETACHED_DIR_NAME / new_dir / "", old_dir);
+        /// tryRenameAll moved the FLAT siblings to "deleting_<part>.<projection>.proj" together
+        /// with the parent; drop them with it.
+        removeDetachedProjectionSiblings(disk, new_dir, keep_shared);
         LOG_DEBUG(log, "Dropped detached part {}, keep shared data: {}", old_dir, keep_shared);
         old_dir.clear();
     }
@@ -10016,15 +10044,7 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> MergeTreeData::cloneAn
         with_copy = " (copying data)";
 
     IDataPartStorage::ClonePartParams params_with_projections = params;
-    {
-        NameSet owned_projections;
-        for (const auto & [projection_name, _] : src_part->getProjectionParts())
-            owned_projections.insert(projection_name + ".proj");
-        for (const auto & [file_name, _] : src_part->checksums.files)
-            if (file_name.ends_with(".proj"))
-                owned_projections.insert(file_name);
-        params_with_projections.projections_to_copy = std::move(owned_projections);
-    }
+    params_with_projections.projections_to_copy = src_part->getOwnedProjectionDirectoryNames();
 
     std::shared_ptr<IDataPartStorage> dst_part_storage{};
     if (on_same_disk)
@@ -10052,7 +10072,7 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> MergeTreeData::cloneAn
             read_settings,
             write_settings,
             /* save_metadata_callback= */ {},
-            params);
+            params_with_projections);
     }
 
     if (params.metadata_version_to_write.has_value())
@@ -10322,13 +10342,7 @@ PartitionCommandsResultInfo MergeTreeData::freezePartitionsByMatcher(
                 {
                     .make_source_readonly = true
                 };
-                NameSet owned_projections;
-                for (const auto & [projection_name, _] : part->getProjectionParts())
-                    owned_projections.insert(projection_name + ".proj");
-                for (const auto & [file_name, _] : part->checksums.files)
-                    if (file_name.ends_with(".proj"))
-                        owned_projections.insert(file_name);
-                params.projections_to_copy = std::move(owned_projections);
+                params.projections_to_copy = part->getOwnedProjectionDirectoryNames();
 
                 auto new_storage = data_part_storage->freeze(
                     backup_part_path,
@@ -10386,6 +10400,22 @@ bool MergeTreeData::removeDetachedPart(DiskPtr disk, const String & path, const 
     disk->removeRecursive(path);
 
     return false;
+}
+
+void MergeTreeData::removeDetachedProjectionSiblings(const DiskPtr & disk, const String & dir_name, bool keep_shared)
+{
+    fs::path detached_root = fs::path(relative_data_path) / DETACHED_DIR_NAME;
+    const String prefix = dir_name + ".";
+    Strings siblings;
+    for (auto it = disk->iterateDirectory(detached_root); it->isValid(); it->next())
+        if (startsWith(it->name(), prefix) && (endsWith(it->name(), ".proj") || endsWith(it->name(), ".tmp_proj")))
+            siblings.push_back(it->name());
+
+    for (const auto & name : siblings)
+    {
+        LOG_DEBUG(log, "Dropping projection sibling {} of detached part {}, keep shared data: {}", name, dir_name, keep_shared);
+        disk->removeSharedRecursive(detached_root / name / "", keep_shared, {});
+    }
 }
 
 PartitionCommandsResultInfo MergeTreeData::unfreezePartitionsByMatcher(MatcherFn matcher, const String & backup_name, ContextPtr local_context)

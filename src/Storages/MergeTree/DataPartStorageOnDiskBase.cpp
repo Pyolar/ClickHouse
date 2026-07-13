@@ -705,7 +705,8 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::clonePart(
     const ReadSettings & read_settings,
     const WriteSettings & write_settings,
     LoggerPtr log,
-    const std::function<void()> & cancellation_hook) const
+    const std::function<void()> & cancellation_hook,
+    const std::optional<NameSet> & projections_to_copy) const
 {
     String path_to_clone = fs::path(to) / dir_path / "";
     auto src_disk = volume->getDisk();
@@ -740,12 +741,21 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::clonePart(
     std::vector<std::pair<String, String>> flat_projection_copies;
     for (auto proj = iterateProjections(false); proj->isValid(); proj->next())
     {
-        if (proj->format() == ProjectionStorageFormat::FLAT)
+        if (proj->format() != ProjectionStorageFormat::FLAT)
+            continue;
+
+        /// An on-disk sibling the part does not own is residue of a failed operation on a
+        /// same-named part; cloning it would let the copy adopt foreign data.
+        if (projections_to_copy && !projections_to_copy->contains(proj->name()))
         {
-            String proj_from = fs::path(proj->rootPath()) / proj->realName();
-            String proj_to = fs::path(to) / (dir_path + "." + proj->name());
-            flat_projection_copies.emplace_back(std::move(proj_from), std::move(proj_to));
+            LOG_WARNING(log, "Not cloning projection directory {} of part {}: not owned by the part",
+                proj->realName(), dir_path);
+            continue;
         }
+
+        String proj_from = fs::path(proj->rootPath()) / proj->realName();
+        String proj_to = fs::path(to) / (dir_path + "." + proj->name());
+        flat_projection_copies.emplace_back(std::move(proj_from), std::move(proj_to));
     }
 
     try

@@ -159,7 +159,8 @@ public:
         const ReadSettings & read_settings,
         const WriteSettings & write_settings,
         LoggerPtr log,
-        const std::function<void()> & cancellation_hook
+        const std::function<void()> & cancellation_hook,
+        const std::optional<NameSet> & projections_to_copy
         ) const override;
 
     void rename(

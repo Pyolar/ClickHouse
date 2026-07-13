@@ -330,7 +330,10 @@ public:
         const ReadSettings & read_settings,
         const WriteSettings & write_settings,
         LoggerPtr log,
-        const std::function<void()> & cancellation_hook
+        const std::function<void()> & cancellation_hook,
+        /// FLAT projection siblings owned by the part (logical `p.proj` names);
+        /// nullopt - copy every detected sibling.
+        const std::optional<NameSet> & projections_to_copy
         ) const = 0;
 
     /// Change part's root. from_root should be a prefix path of current root path.

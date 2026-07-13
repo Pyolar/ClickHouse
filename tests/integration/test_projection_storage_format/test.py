@@ -406,6 +406,8 @@ def test_zero_copy_mutation_preserves_flat_projection():
         == baseline
     )
     assert check_table("t_zc", node2) == "1"
+
+
 def table_path(name, n=node):
     return (
         n.query(f"SELECT data_paths[1] FROM system.tables WHERE name = '{name}'")
@@ -716,3 +718,180 @@ def test_stale_tmp_fetch_sibling_removed():
         "t_fetch", node2, extra_settings="force_optimize_projection = 1"
     ) == proj_query("t_fetch", node)
     assert check_table("t_fetch", node2) == "1"
+
+
+# Ownership filter (MOVE PART): a flat sibling the part does not own (here: the part was
+# written with materialize_projections_on_insert = 0, so it has no projection at all) is
+# residue of a failed operation on a same-named part. A cross-disk move clones the part
+# via clonePart and must not copy the unowned sibling to the destination.
+# https://github.com/ClickHouse/ClickHouse/pull/108443#discussion_r3569019427
+def test_move_part_skips_unowned_sibling():
+    node.query("DROP TABLE IF EXISTS t_move SYNC")
+    node.query("SYSTEM STOP MERGES")
+    node.query(
+        """CREATE TABLE t_move (key UInt64, id UInt64, value String,
+           PROJECTION p (SELECT key, id ORDER BY id))
+           ENGINE = MergeTree ORDER BY key
+           SETTINGS min_bytes_for_wide_part = 0, projection_storage_format = 'flat',
+               materialize_projections_on_insert = 0, storage_policy = 'default_and_s3'"""
+    )
+    node.query(
+        "INSERT INTO t_move SELECT number, number * 2, toString(number) FROM numbers(1000)"
+    )
+    src = part_dir("t_move")
+    name = part_name("t_move")
+    plant_stale_live_sibling(f"{src}.p.proj")
+    node.query(f"ALTER TABLE t_move MOVE PART '{name}' TO DISK 's3'")
+    dst = part_dir("t_move")
+    assert dst != src  # the part really moved
+    assert not path_exists(f"{dst}.p.proj")
+    assert not path_exists(f"{dst}/p.proj")
+    assert node.contains_in_log(f"Not cloning projection directory {name}.p.proj")
+    assert active_projection_parts("t_move") == "0"
+    assert node.query("SELECT count() FROM t_move").strip() == "1000"
+
+
+# Ownership filter (cross-disk ATTACH PARTITION FROM): the destination table lives on a
+# different disk, so cloneAndLoadDataPart takes the freezeRemote path - it must apply the
+# same owned-projections filter as the same-disk freeze path.
+# https://github.com/ClickHouse/ClickHouse/pull/108443#discussion_r3569019441
+def test_attach_from_cross_disk_skips_unowned_sibling():
+    node.query("DROP TABLE IF EXISTS t_att_src SYNC")
+    node.query("DROP TABLE IF EXISTS t_att_dst SYNC")
+    node.query("SYSTEM STOP MERGES")
+    for tname, policy in (("t_att_src", ""), ("t_att_dst", ", storage_policy = 's3'")):
+        node.query(
+            f"""CREATE TABLE {tname} (key UInt64, id UInt64, value String,
+                PROJECTION p (SELECT key, id ORDER BY id))
+                ENGINE = MergeTree ORDER BY key
+                SETTINGS min_bytes_for_wide_part = 0, projection_storage_format = 'flat',
+                    materialize_projections_on_insert = 0{policy}"""
+        )
+    node.query(
+        "INSERT INTO t_att_src SELECT number, number * 2, toString(number) FROM numbers(1000)"
+    )
+    plant_stale_live_sibling(f"{part_dir('t_att_src')}.p.proj")
+    node.query("ALTER TABLE t_att_dst ATTACH PARTITION tuple() FROM t_att_src")
+    p = part_dir("t_att_dst")
+    assert not path_exists(f"{p}.p.proj")
+    assert not path_exists(f"{p}/p.proj")
+    assert active_projection_parts("t_att_dst") == "0"
+    assert node.query("SELECT count() FROM t_att_dst").strip() == "1000"
+    assert check_table("t_att_dst") == "1"
+
+
+# Ownership filter (mutation): the column-subset mutation path discovers projections from
+# disk; a sibling the source part's checksums do not reference must not be hardlinked into
+# the mutated part. The mutated column is not used by the projection, so an owned
+# projection would be hardlinked - the unowned one must be skipped instead.
+def test_mutation_skips_unowned_sibling():
+    node.query("DROP TABLE IF EXISTS t_mut SYNC")
+    node.query("SYSTEM STOP MERGES")
+    node.query(
+        """CREATE TABLE t_mut (key UInt64, id UInt64, value String,
+           PROJECTION p (SELECT key, id ORDER BY id))
+           ENGINE = MergeTree ORDER BY key
+           SETTINGS min_bytes_for_wide_part = 0, projection_storage_format = 'flat',
+               materialize_projections_on_insert = 0"""
+    )
+    node.query(
+        "INSERT INTO t_mut SELECT number, number * 2, toString(number) FROM numbers(1000)"
+    )
+    src = part_dir("t_mut")
+    plant_stale_live_sibling(f"{src}.p.proj")
+    node.query(
+        "ALTER TABLE t_mut UPDATE value = concat(value, 'x') WHERE 1 SETTINGS mutations_sync = 1"
+    )
+    p = part_dir("t_mut")
+    assert p != src  # the mutation produced a new part
+    assert not path_exists(f"{p}.p.proj")
+    assert not path_exists(f"{p}/p.proj")
+    assert active_projection_parts("t_mut") == "0"
+    assert node.query("SELECT count() FROM t_mut").strip() == "1000"
+
+
+# Manifest repair: regenerating a lost checksums.txt restores records only for projections
+# declared in the table metadata. An undeclared projection directory (here: q.proj, a valid
+# projection dir copied under a name the table never had) must not be legitimized by the
+# regenerated manifest.
+def test_repair_skips_undeclared_projection_dir():
+    setup_table("t_undecl", "projection_storage_format = 'flat'")
+    baseline = proj_query("t_undecl")
+    p = part_dir("t_undecl")
+    node.stop_clickhouse()
+    node.exec_in_container(
+        [
+            "bash",
+            "-c",
+            f"cp -r {p}.p.proj {p}.q.proj && chmod -R 777 {p}.q.proj && rm {p}/checksums.txt",
+        ],
+        privileged=True,
+        user="root",
+    )
+    node.start_clickhouse()
+    assert node.query("SELECT count() FROM t_undecl").strip() == "1000"
+    assert node.contains_in_log(
+        "Not restoring checksums record for projection directory q.proj"
+    )
+    # the regenerated manifest must reference the declared projection and not the undeclared one
+    manifest = node.exec_in_container(
+        ["bash", "-c", f"grep -ao '[pq]\\.proj' {p}/checksums.txt | sort -u"],
+        privileged=True,
+        user="root",
+    )
+    assert "p.proj" in manifest
+    assert "q.proj" not in manifest
+    assert broken_projection_parts("t_undecl") == "0"
+    assert (
+        proj_query("t_undecl", extra_settings="force_optimize_projection = 1")
+        == baseline
+    )
+
+
+# Detached surface: after DETACH PART on a FLAT table, system.detached_parts must show one
+# entry (no junk row for the sibling) whose bytes_on_disk includes the sibling, and
+# DROP DETACHED PART must remove the sibling too.
+# https://github.com/ClickHouse/ClickHouse/pull/108443#discussion_r3569019447
+def test_detached_surface_flat_sibling():
+    setup_table("t_det_surf", "projection_storage_format = 'flat'")
+    name = part_name("t_det_surf")
+    table_root = part_dir("t_det_surf").rsplit("/", 1)[0]
+    node.query(f"ALTER TABLE t_det_surf DETACH PART '{name}'")
+    rows = node.query(
+        "SELECT name FROM system.detached_parts WHERE table = 't_det_surf'"
+    ).strip()
+    assert rows == name  # exactly one entry, no row for the sibling
+    bytes_on_disk = int(
+        node.query(
+            f"SELECT bytes_on_disk FROM system.detached_parts WHERE table = 't_det_surf' AND name = '{name}'"
+        ).strip()
+    )
+
+    def files_size(path):
+        return int(
+            node.exec_in_container(
+                [
+                    "bash",
+                    "-c",
+                    f"find {path} -type f -printf '%s\\n' | awk '{{s+=$1}} END {{print s+0}}'",
+                ],
+                privileged=True,
+                user="root",
+            ).strip()
+        )
+
+    parent_size = files_size(f"{table_root}/detached/{name}")
+    sibling_size = files_size(f"{table_root}/detached/{name}.p.proj")
+    assert sibling_size > 0
+    assert bytes_on_disk >= parent_size + sibling_size
+    node.query(
+        f"ALTER TABLE t_det_surf DROP DETACHED PART '{name}' SETTINGS allow_drop_detached = 1"
+    )
+    assert not path_exists(f"{table_root}/detached/{name}")
+    assert not path_exists(f"{table_root}/detached/{name}.p.proj")
+    leftovers = node.exec_in_container(
+        ["bash", "-c", f"find {table_root}/detached -maxdepth 1 -name '*.proj' | wc -l"],
+        privileged=True,
+        user="root",
+    ).strip()
+    assert leftovers == "0"

@@ -2555,7 +2555,10 @@ private:
         for (auto proj = ctx->source_part->getDataPartStorage().iterateProjections(false); proj->isValid(); proj->next())
         {
             const String projection_dir = proj->name();
-            if (ctx->files_to_skip.contains(projection_dir))
+            /// Same ownership rule as the checksums-driven mutate path: a discovered directory the
+            /// source part does not reference must not be carried into the new part.
+            if (ctx->files_to_skip.contains(projection_dir)
+                || !ctx->source_part->checksums.has(projection_dir))
                 continue;
 
             auto rename_it = std::find_if(ctx->files_to_rename.begin(), ctx->files_to_rename.end(), [&projection_dir](const auto & rename_pair)

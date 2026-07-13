@@ -515,6 +515,11 @@ public:
 
     const std::map<String, std::shared_ptr<IMergeTreeDataPart>> & getProjectionParts() const { return projection_parts; }
 
+    /// Projection sub-part directory names this part owns (logical "<name>.proj"): loaded
+    /// projections plus `.proj` entries of its checksums. Used to filter FLAT siblings in
+    /// copy/clone operations so that residue of unrelated same-named parts is not adopted.
+    NameSet getOwnedProjectionDirectoryNames() const;
+
     MergeTreeDataPartBuilder
     getProjectionPartBuilder(const String & projection_name, ProjectionDescriptionRawPtr projection, bool is_temp_projection = false);
 

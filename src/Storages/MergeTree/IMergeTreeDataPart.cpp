@@ -1395,6 +1395,17 @@ void IMergeTreeDataPart::addProjectionPart(
     projection_parts[projection_name] = std::move(projection_part);
 }
 
+NameSet IMergeTreeDataPart::getOwnedProjectionDirectoryNames() const
+{
+    NameSet result;
+    for (const auto & [projection_name, _] : getProjectionParts())
+        result.insert(projection_name + ".proj");
+    for (const auto & [file_name, _] : checksums.files)
+        if (file_name.ends_with(".proj"))
+            result.insert(file_name);
+    return result;
+}
+
 void IMergeTreeDataPart::loadProjections(
     bool require_columns_checksums, bool check_consistency, bool & has_broken_projection, bool if_not_loaded, bool only_metadata)
 {
@@ -1849,9 +1860,25 @@ void IMergeTreeDataPart::loadChecksums(bool require)
 
         /// checkDataPart folds projection records only from the loaded projection map, which is still
         /// empty at this point of the load; restore them from the on-disk projection dirs instead.
+        /// Only projections declared in the table metadata get a record: a directory that is neither
+        /// loaded nor declared is residue of another operation and the regenerated manifest must not
+        /// legitimize it. (A stale directory under a DECLARED projection name is indistinguishable
+        /// here - the manifest that could tell them apart is the one being rebuilt.)
+        NameSet declared_projections;
+        auto metadata_snapshot = storage.getInMemoryMetadataPtr(storage.getContext(), false);
+        for (const auto & projection : metadata_snapshot->projections)
+            declared_projections.insert(projection.name + ".proj");
+
         static constexpr auto projection_checksums_file = "checksums.txt";
         for (auto proj = getDataPartStorage().iterateProjections(false); proj->isValid(); proj->next())
         {
+            if (!declared_projections.contains(proj->name()))
+            {
+                LOG_WARNING(storage.log, "Not restoring checksums record for projection directory {} of part {}: "
+                    "no such projection in the table metadata", proj->name(), name);
+                continue;
+            }
+
             auto projection_storage = getDataPartStorage().getProjection(proj->name());
             if (!projection_storage->existsFile(projection_checksums_file))
                 continue;
@@ -2558,7 +2585,15 @@ MutableDataPartStoragePtr IMergeTreeDataPart::makeCloneOnDisk(
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Can not clone data part {} to empty directory.", name);
 
     String path_to_clone = fs::path(storage.relative_data_path) / directory_name / "";
-    return getDataPartStorage().clonePart(path_to_clone, getDataPartStorage().getPartDirectory(), disk, read_settings, write_settings, storage.log.load(), cancellation_hook);
+    return getDataPartStorage().clonePart(
+        path_to_clone,
+        getDataPartStorage().getPartDirectory(),
+        disk,
+        read_settings,
+        write_settings,
+        storage.log.load(),
+        cancellation_hook,
+        getOwnedProjectionDirectoryNames());
 }
 
 IndexSize IMergeTreeDataPart::getIndexSizeFromFile() const
