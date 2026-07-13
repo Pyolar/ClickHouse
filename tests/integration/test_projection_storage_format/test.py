@@ -468,6 +468,218 @@ def test_stale_tmp_insert_sibling_removed():
     assert check_table("t_ins") == "1"
 
 
+def plant_stale_live_sibling(path):
+    """A flat projection sibling under a LIVE part name whose parent never committed:
+    the residue of a publish that crashed between the sibling and parent renames."""
+    node.exec_in_container(
+        [
+            "bash",
+            "-c",
+            f"mkdir -p {path} && touch {path}/stale_marker.txt && chmod -R 777 {path}",
+        ],
+        privileged=True,
+        user="root",
+    )
+
+
+# Destination-clearing: a stale flat sibling left at a LIVE part name must not be
+# adopted by a later part reusing that name; publishing the name again removes it.
+def test_stale_live_sibling_not_adopted():
+    node.query("DROP TABLE IF EXISTS t_adopt SYNC")
+    node.query("SYSTEM STOP MERGES")
+    node.query(
+        """CREATE TABLE t_adopt (key UInt64, id UInt64, value String,
+           PROJECTION p (SELECT key, id, value ORDER BY id))
+           ENGINE = MergeTree ORDER BY key
+           SETTINGS min_bytes_for_wide_part = 0, projection_storage_format = 'flat',
+               materialize_projections_on_insert = 0"""
+    )
+    plant_stale_live_sibling(f"{table_path('t_adopt')}/all_1_1_0.p.proj")
+    node.query(
+        "INSERT INTO t_adopt SELECT number, number * 2, toString(number) FROM numbers(1000)"
+    )
+    p = part_dir("t_adopt")
+    assert p.endswith("all_1_1_0")  # the name collision really happened
+    node.restart_clickhouse()
+    # the part was written without the projection, so nothing may serve one
+    assert active_projection_parts("t_adopt") == "0"
+    assert not path_exists(f"{p}.p.proj")
+    assert node.query("SELECT count() FROM t_adopt").strip() == "1000"
+    assert check_table("t_adopt") == "1"
+
+
+# Destination-clearing: publishing a part WITH a projection over a stale sibling at the
+# destination name must clear the leftover instead of failing the sibling rename.
+def test_stale_live_sibling_replaced_by_real():
+    node.query("DROP TABLE IF EXISTS t_repl_sib SYNC")
+    node.query("SYSTEM STOP MERGES")
+    node.query(
+        """CREATE TABLE t_repl_sib (key UInt64, id UInt64, value String,
+           PROJECTION p (SELECT key, id, value ORDER BY id))
+           ENGINE = MergeTree ORDER BY key
+           SETTINGS min_bytes_for_wide_part = 0, projection_storage_format = 'flat'"""
+    )
+    plant_stale_live_sibling(f"{table_path('t_repl_sib')}/all_1_1_0.p.proj")
+    node.query(
+        "INSERT INTO t_repl_sib SELECT number, number * 2, toString(number) FROM numbers(1000)"
+    )
+    p = part_dir("t_repl_sib")
+    assert p.endswith("all_1_1_0")
+    assert path_exists(f"{p}.p.proj")
+    assert not path_exists(f"{p}.p.proj/stale_marker.txt")
+    assert (
+        proj_query("t_repl_sib", extra_settings="force_optimize_projection = 1")
+        == "100\t4950"
+    )
+    assert check_table("t_repl_sib") == "1"
+
+
+# DETACH/ATTACH must never leave a mixed state: after DETACH nothing of the part stays
+# at live names; after ATTACH the parent and its flat sibling are both live again.
+def test_detach_attach_no_mixed_state():
+    setup_table("t_mix", "projection_storage_format = 'flat'")
+    baseline = proj_query("t_mix")
+    live = part_dir("t_mix")
+    name = part_name("t_mix")
+    table_root = live.rsplit("/", 1)[0]
+    node.query(f"ALTER TABLE t_mix DETACH PART '{name}'")
+    assert not path_exists(live)
+    assert not path_exists(f"{live}.p.proj")
+    assert path_exists(f"{table_root}/detached/{name}")
+    assert path_exists(f"{table_root}/detached/{name}.p.proj")
+    node.query(f"ALTER TABLE t_mix ATTACH PART '{name}'")
+    p = part_dir("t_mix")
+    assert path_exists(f"{p}.p.proj")
+    leftover = node.exec_in_container(
+        ["bash", "-c", f"find {table_root}/detached -maxdepth 1 -name '*.proj' | wc -l"],
+        privileged=True,
+        user="root",
+    ).strip()
+    assert leftover == "0"
+    assert broken_projection_parts("t_mix") == "0"
+    assert (
+        proj_query("t_mix", extra_settings="force_optimize_projection = 1") == baseline
+    )
+
+
+# A leftover delete_tmp_ pair from an interrupted removal must not block a new removal
+# of the same part name, and the flat sibling must be cleaned with it.
+def test_delete_tmp_leftovers_cleaned_on_drop():
+    setup_table("t_dtmp", "projection_storage_format = 'flat'")
+    name = part_name("t_dtmp")
+    root = part_dir("t_dtmp").rsplit("/", 1)[0]
+    plant_stale_tmp_dir(f"{root}/delete_tmp_{name}")
+    node.query(f"ALTER TABLE t_dtmp DROP PART '{name}'")
+    wait_for(lambda: not path_exists(f"{root}/{name}"))
+    wait_for(lambda: not path_exists(f"{root}/{name}.p.proj"))
+    wait_for(lambda: not path_exists(f"{root}/delete_tmp_{name}"))
+    wait_for(lambda: not path_exists(f"{root}/delete_tmp_{name}.p.proj"))
+    assert not path_exists(f"{root}/delete_tmp_{name}.p.proj")
+
+
+# DROP PART of a part whose flat sibling vanished must still remove the part completely
+# instead of aborting the cleanup halfway.
+def test_remove_tolerates_missing_sibling():
+    setup_table("t_nosib", "projection_storage_format = 'flat'")
+    p = part_dir("t_nosib")
+    name = part_name("t_nosib")
+    root = p.rsplit("/", 1)[0]
+    node.stop_clickhouse()
+    node.exec_in_container(
+        ["bash", "-c", f"rm -rf {p}.p.proj"], privileged=True, user="root"
+    )
+    node.start_clickhouse()
+    assert node.query("SELECT count() FROM t_nosib").strip() == "1000"
+    node.query(f"ALTER TABLE t_nosib DROP PART '{name}'")
+    wait_for(lambda: not path_exists(p))
+    assert not path_exists(p)
+    leftovers = node.exec_in_container(
+        ["bash", "-c", f"find {root} -maxdepth 1 -name 'delete_tmp_*' | wc -l"],
+        privileged=True,
+        user="root",
+    ).strip()
+    assert leftovers == "0"
+
+
+# A projection dir present on disk but absent from the manifest means some operation
+# diverged from checksums.txt; loading it must leave a warning in the log.
+def test_unlisted_projection_warns():
+    setup_table("t_warn_src", "projection_storage_format = 'flat'")
+    node.query("DROP TABLE IF EXISTS t_warn SYNC")
+    node.query(
+        """CREATE TABLE t_warn (key UInt64, id UInt64, value String,
+           PROJECTION p (SELECT key, id, value ORDER BY id))
+           ENGINE = MergeTree ORDER BY key
+           SETTINGS min_bytes_for_wide_part = 0, projection_storage_format = 'flat',
+               materialize_projections_on_insert = 0"""
+    )
+    node.query(
+        "INSERT INTO t_warn SELECT number, number * 2, toString(number) FROM numbers(1000)"
+    )
+    src_sib = f"{part_dir('t_warn_src')}.p.proj"
+    dst_sib = f"{part_dir('t_warn')}.p.proj"
+    node.stop_clickhouse()
+    node.exec_in_container(
+        ["bash", "-c", f"cp -r {src_sib} {dst_sib} && chmod -R 777 {dst_sib}"],
+        privileged=True,
+        user="root",
+    )
+    node.start_clickhouse()
+    assert node.query("SELECT count() FROM t_warn").strip() == "1000"
+    assert node.contains_in_log("loads projection p that is not referenced by its checksums.txt")
+
+
+# Regenerating a lost manifest must restore projection records: checkDataPart folds them
+# only from the loaded projection map, which is empty during the repair inside
+# loadChecksums, so the regenerated checksums.txt silently loses every projection and the
+# part fails CHECK TABLE forever after.
+def test_repair_regenerates_projection_records():
+    for tname, extra in (
+        ("t_fix_nested", ""),
+        ("t_fix_flat", "projection_storage_format = 'flat'"),
+    ):
+        setup_table(tname, extra)
+        baseline = proj_query(tname)
+        p = part_dir(tname)
+        node.stop_clickhouse()
+        node.exec_in_container(
+            ["bash", "-c", f"rm {p}/checksums.txt"], privileged=True, user="root"
+        )
+        node.start_clickhouse()
+        assert node.query(f"SELECT count() FROM {tname}").strip() == "1000", tname
+        assert broken_projection_parts(tname) == "0", tname
+        assert (
+            proj_query(tname, extra_settings="force_optimize_projection = 1")
+            == baseline
+        ), tname
+        assert check_table(tname) == "1", tname
+        # the regenerated manifest must reference the projection: it has to survive a reload
+        node.restart_clickhouse()
+        assert active_projection_parts(tname) == "1", tname
+        assert check_table(tname) == "1", tname
+
+
+# Destination-clearing in the detached namespace: a stale sibling under detached/ must
+# not fail DETACH of a real part carrying the same name.
+def test_publish_over_stale_detached_sibling():
+    setup_table("t_det_sib", "projection_storage_format = 'flat'")
+    baseline = proj_query("t_det_sib")
+    name = part_name("t_det_sib")
+    table_root = part_dir("t_det_sib").rsplit("/", 1)[0]
+    plant_stale_live_sibling(f"{table_root}/detached/{name}.p.proj")
+    node.query(f"ALTER TABLE t_det_sib DETACH PART '{name}'")
+    assert path_exists(f"{table_root}/detached/{name}.p.proj")
+    assert not path_exists(f"{table_root}/detached/{name}.p.proj/stale_marker.txt")
+    node.query(f"ALTER TABLE t_det_sib ATTACH PART '{name}'")
+    p = part_dir("t_det_sib")
+    assert path_exists(f"{p}.p.proj")
+    assert broken_projection_parts("t_det_sib") == "0"
+    assert (
+        proj_query("t_det_sib", extra_settings="force_optimize_projection = 1")
+        == baseline
+    )
+
+
 # Issue #1 (removeSharedRecursive): a retried fetch finds the tmp-fetch_<part> dir of a
 # previously failed fetch and wipes it via removeSharedRecursive - the stale flat sibling
 # must die with it. Otherwise the retried download materializes the projection into the

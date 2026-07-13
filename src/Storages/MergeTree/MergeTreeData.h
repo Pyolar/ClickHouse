@@ -994,6 +994,10 @@ public:
     size_t clearOldTemporaryDirectories(size_t custom_directories_lifetime_seconds, const NameSet & valid_prefixes = {"tmp_", "tmp-fetch_"});
     size_t clearOldTemporaryDirectories(const String & root_path, size_t custom_directories_lifetime_seconds, const NameSet & valid_prefixes);
 
+    /// Removes FLAT projection sibling dirs whose owner part directory does not exist (residue of
+    /// interrupted multi-directory operations). Safe only while no renames are in flight (startup).
+    size_t clearOrphanProjectionSiblings();
+
     size_t clearEmptyParts();
 
     /// Moves to outdated state patch parts that do not need to be applied to regular parts.

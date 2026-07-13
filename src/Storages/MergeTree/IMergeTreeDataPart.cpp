@@ -1412,6 +1412,11 @@ void IMergeTreeDataPart::loadProjections(
         auto projection_path = projection.name + ".proj";
         if (getDataPartStorage().hasProjection(projection_path))
         {
+            /// Membership is decided by the parent directory's presence; an unlisted projection means
+            /// some operation diverged from the manifest and deserves a trace.
+            if (!checksums.empty() && !checksums.has(projection_path))
+                LOG_WARNING(storage.log, "Part {} loads projection {} that is not referenced by its checksums.txt", name, projection.name);
+
             if (hasProjection(projection.name))
             {
                 if (!if_not_loaded)
@@ -1841,6 +1846,32 @@ void IMergeTreeDataPart::loadChecksums(bool require)
 
         bool noop = false;
         checksums = checkDataPart(shared_from_this(), false, noop, /* is_cancelled */[]{ return false; }, /* throw_on_broken_projection */false);
+
+        /// checkDataPart folds projection records only from the loaded projection map, which is still
+        /// empty at this point of the load; restore them from the on-disk projection dirs instead.
+        static constexpr auto projection_checksums_file = "checksums.txt";
+        for (auto proj = getDataPartStorage().iterateProjections(false); proj->isValid(); proj->next())
+        {
+            auto projection_storage = getDataPartStorage().getProjection(proj->name());
+            if (!projection_storage->existsFile(projection_checksums_file))
+                continue;
+
+            try
+            {
+                MergeTreeDataPartChecksums projection_checksums;
+                auto in = projection_storage->readFile(projection_checksums_file, {}, {});
+                if (projection_checksums.read(*in))
+                    checksums.addFile(proj->name(), projection_checksums.getTotalSizeOnDisk(), projection_checksums.getTotalChecksumUInt128());
+            }
+            catch (...)
+            {
+                /// A record for an unreadable projection would only mark the part broken; the later
+                /// projection load will handle the directory itself.
+                LOG_WARNING(storage.log, "Cannot restore checksums record for projection {} of part {}: {}",
+                    proj->name(), name, getCurrentExceptionMessage(false));
+            }
+        }
+
         writeChecksums(checksums, {});
 
         bytes_on_disk = checksums.getTotalSizeOnDisk();
@@ -2318,7 +2349,14 @@ void IMergeTreeDataPart::renameTo(const String & new_relative_path, bool remove_
 
     auto old_projection_root_path = strip_slash(getDataPartStorage().getRelativePath());
 
-    getDataPartStorage().rename(to.parent_path(), to.filename(), storage.log.load(), remove_new_dir_if_exists, fsync_dir);
+    /// A target outside the live namespace (a subdirectory like detached/, or a temporary name) moves
+    /// the parent first: a crash may strand parentless siblings, never a live parent without its siblings.
+    bool parent_moves_first = new_relative_path.find('/') != String::npos
+        || new_relative_path.starts_with("tmp_")
+        || new_relative_path.starts_with("tmp-fetch_")
+        || new_relative_path.starts_with("delete_tmp_");
+
+    getDataPartStorage().rename(to.parent_path(), to.filename(), storage.log.load(), remove_new_dir_if_exists, fsync_dir, parent_moves_first);
 
     auto new_projection_root_path = to.string();
 

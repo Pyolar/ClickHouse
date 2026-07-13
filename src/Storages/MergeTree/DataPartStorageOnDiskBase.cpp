@@ -528,19 +528,32 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::freeze(
     /// LEGACY_NESTED projections are copied with the main part; FLAT projections should be handled separately
     for (auto proj = iterateProjections(false); proj->isValid(); proj->next())
     {
-        if (proj->format() == ProjectionStorageFormat::FLAT)
-            Backup(
-                disk,
-                disk,
-                fs::path(proj->rootPath()) / proj->realName(),
-                fs::path(to) / (dir_path + "." + proj->name()),
-                read_settings,
-                write_settings,
-                params.make_source_readonly,
-                {},
-                params.copy_instead_of_hardlink,
-                params.files_to_copy_instead_of_hardlinks,
-                params.external_transaction);
+        if (proj->format() != ProjectionStorageFormat::FLAT)
+            continue;
+        if (params.projections_to_copy && !params.projections_to_copy->contains(proj->name()))
+            continue;
+
+        /// A leftover directory at the destination is residue of a failed operation on a same-named part.
+        String proj_dst = fs::path(to) / (dir_path + "." + proj->name());
+        if (disk->existsDirectory(proj_dst))
+        {
+            LOG_WARNING(getLogger("DataPartStorageOnDiskBase"), "Removing stale projection directory {} at freeze destination", fullPath(disk, proj_dst));
+            /// Do not remove blobs if they exist
+            disk->removeSharedRecursive(fs::path(proj_dst) / "", true, {});
+        }
+
+        Backup(
+            disk,
+            disk,
+            fs::path(proj->rootPath()) / proj->realName(),
+            proj_dst,
+            read_settings,
+            write_settings,
+            params.make_source_readonly,
+            {},
+            params.copy_instead_of_hardlink,
+            params.files_to_copy_instead_of_hardlinks,
+            params.external_transaction);
     }
     Backup(
         disk,
@@ -608,19 +621,32 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::freezeRemote(
     /// LEGACY_NESTED projections are copied with the main part; FLAT projections should be handled separately
     for (auto proj = iterateProjections(false); proj->isValid(); proj->next())
     {
-        if (proj->format() == ProjectionStorageFormat::FLAT)
-            Backup(
-                src_disk,
-                dst_disk,
-                fs::path(proj->rootPath()) / proj->realName(),
-                fs::path(to) / (dir_path + "." + proj->name()),
-                read_settings,
-                write_settings,
-                params.make_source_readonly,
-                {},
-                true,
-                {},
-                params.external_transaction);
+        if (proj->format() != ProjectionStorageFormat::FLAT)
+            continue;
+        if (params.projections_to_copy && !params.projections_to_copy->contains(proj->name()))
+            continue;
+
+        /// A leftover directory at the destination is residue of a failed operation on a same-named part.
+        String proj_dst = fs::path(to) / (dir_path + "." + proj->name());
+        if (dst_disk->existsDirectory(proj_dst))
+        {
+            LOG_WARNING(getLogger("DataPartStorageOnDiskBase"), "Removing stale projection directory {} at freeze destination", fullPath(dst_disk, proj_dst));
+            /// Do not remove blobs if they exist
+            dst_disk->removeSharedRecursive(fs::path(proj_dst) / "", true, {});
+        }
+
+        Backup(
+            src_disk,
+            dst_disk,
+            fs::path(proj->rootPath()) / proj->realName(),
+            proj_dst,
+            read_settings,
+            write_settings,
+            params.make_source_readonly,
+            {},
+            true,
+            {},
+            params.external_transaction);
     }
     /// freezeRemote() using copy instead of hardlinks for all files
     /// In this case, files_to_copy_intead_of_hardlinks is set by empty
@@ -691,6 +717,25 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::clonePart(
                         dir_path, getRelativePath(), path_to_clone, fullPath(dst_disk, path_to_clone));
     }
 
+    /// Unlike the ambiguous occupied parent dir above, a sibling without its parent dir is provably residue
+    /// of an interrupted clone (siblings copy before the parent); left in place it would taint the copy.
+    {
+        const String dest_root = fs::path(to) / fs::path(dir_path).parent_path();
+        const String sibling_prefix = fs::path(dir_path).filename().string() + ".";
+        std::vector<String> stale_siblings;
+        if (dst_disk->existsDirectory(dest_root))
+            for (auto it = dst_disk->iterateDirectory(dest_root); it->isValid(); it->next())
+                if (it->name().starts_with(sibling_prefix) && (it->name().ends_with(".proj") || it->name().ends_with(".tmp_proj")))
+                    stale_siblings.push_back(fs::path(dest_root) / it->name());
+
+        for (const auto & stale : stale_siblings)
+        {
+            LOG_WARNING(log, "Removing stale projection directory {} left by an interrupted clone", fullPath(dst_disk, stale));
+            /// Destination content only ever comes from copyDirectoryContent, so blobs are never shared
+            dst_disk->removeRecursive(stale);
+        }
+    }
+
     /// LEGACY_NESTED projections are copied with the main part; FLAT projections should be handled separately
     std::vector<std::pair<String, String>> flat_projection_copies;
     for (auto proj = iterateProjections(false); proj->isValid(); proj->next())
@@ -738,7 +783,8 @@ void DataPartStorageOnDiskBase::rename(
     std::string new_part_dir,
     LoggerPtr log,
     bool remove_new_dir_if_exists,
-    bool fsync_part_dir)
+    bool fsync_part_dir,
+    bool parent_moves_first)
 {
     if (new_root_path.ends_with('/'))
         new_root_path.pop_back();
@@ -774,26 +820,79 @@ void DataPartStorageOnDiskBase::rename(
 
     String from = getRelativePath();
 
-    /// LEGACY_NESTED projections are copied with the main part; FLAT projections should be handled separately
-    std::vector<std::pair<String, String>> flat_projection_moves;
-    for (auto proj = iterateProjections(false); proj->isValid(); proj->next())
+    /// A nested projection shadows a same-named flat sibling (same rule as ProjectionIteratorOnDisk).
+    NameSet nested_projections;
+    for (auto it = volume->getDisk()->iterateDirectory(from); it->isValid(); it->next())
+        if (it->name().ends_with(".proj"))
+            nested_projections.insert(it->name());
+
+    auto without_trailing_slash = [](String path)
     {
-        if (proj->format() == ProjectionStorageFormat::FLAT)
+        while (path.size() > 1 && path.ends_with('/'))
+            path.pop_back();
+        return path;
+    };
+
+    const String source_flat_root = without_trailing_slash(fs::path(root_path) / fs::path(part_dir).parent_path());
+    const String source_prefix = fs::path(part_dir).filename().string() + ".";
+    const String dest_prefix = new_part_dir + ".";
+    /// Typical renames stay within one directory: one listing then serves both the move collection and the sweep.
+    const bool same_root = source_flat_root == without_trailing_slash(new_root_path);
+
+    std::vector<std::pair<String, String>> flat_projection_moves;
+    /// Nothing of this part has moved yet, so ANY existing sibling at a destination name is residue
+    /// of a failed operation on a same-named part; taking the name over it would resurrect foreign data.
+    std::vector<String> stale_siblings;
+
+    auto scan_flat_siblings = [&](const String & dir, bool collect_moves, bool collect_stale)
+    {
+        if (!volume->getDisk()->existsDirectory(dir))
+            return;
+        for (auto it = volume->getDisk()->iterateDirectory(dir); it->isValid(); it->next())
         {
-            String proj_from = fs::path(proj->rootPath()) / proj->realName();
-            String proj_to = fs::path(new_root_path) / (new_part_dir + "." + proj->name());
-            flat_projection_moves.emplace_back(std::move(proj_from), std::move(proj_to));
+            const String & entry = it->name();
+            if (!entry.ends_with(".proj") && !entry.ends_with(".tmp_proj"))
+                continue;
+
+            if (collect_moves && entry.ends_with(".proj") && entry.starts_with(source_prefix)
+                && !nested_projections.contains(entry.substr(source_prefix.size())))
+            {
+                flat_projection_moves.emplace_back(
+                    fs::path(dir) / entry,
+                    fs::path(new_root_path) / (new_part_dir + "." + entry.substr(source_prefix.size())));
+            }
+
+            if (collect_stale && entry.starts_with(dest_prefix))
+                stale_siblings.push_back(entry);
         }
+    };
+
+    scan_flat_siblings(source_flat_root, /*collect_moves=*/ true, /*collect_stale=*/ same_root);
+    if (!same_root)
+        scan_flat_siblings(new_root_path, /*collect_moves=*/ false, /*collect_stale=*/ true);
+
+    for (const auto & entry : stale_siblings)
+    {
+        if (log)
+            LOG_WARNING(log, "Removing stale projection sibling {} at rename destination",
+                fullPath(volume->getDisk(), fs::path(new_root_path) / entry));
+
+        /// Do not remove blobs if they exist
+        executeWriteOperation([&](auto & disk) { disk.removeSharedRecursive(fs::path(new_root_path) / entry / "", true, {}); });
     }
 
-    /// Why?
     executeWriteOperation([&](auto & disk)
     {
         disk.setLastModified(from, Poco::Timestamp::fromEpochTime(time(nullptr)));
 
+        if (parent_moves_first)
+            disk.moveDirectory(from, to);
+
         for (const auto & [proj_from, proj_to] : flat_projection_moves)
             disk.moveDirectory(proj_from, proj_to);
-        disk.moveDirectory(from, to);
+
+        if (!parent_moves_first)
+            disk.moveDirectory(from, to);
 
         /// Only after moveDirectory() since before the directory does not exist.
         SyncGuardPtr to_sync_guard;
@@ -1044,50 +1143,62 @@ void DataPartStorageOnDiskBase::remove(
         /// use the current (existing) path. We intentionally don't update part_dir to avoid races.
         if (!can_remove_description)
             can_remove_description.emplace(can_remove_callback());
+    }
 
-        auto strip_trailing_slash = [](String path)
+    auto strip_trailing_slash = [](String path)
+    {
+        if (!path.empty() && path.back() == '/')
+            path.pop_back();
+        return path;
+    };
+    /// Built for the retry on a delete_tmp_ dir too (source == destination there): the later
+    /// per-projection clearDirectory calls need the map in both cases.
+    auto update_projection_info = [&](const String & proj_name)
+    {
+        if (all_projections.contains(proj_name))
+            return;
+        auto projection_storage = getProjection(proj_name);
+        if (!projection_storage->exists())
+            return;
+
+        String source = strip_trailing_slash(projection_storage->getRelativePath());
+        /// A flat sibling dir is "<part_dir>.<name>"; a nested child is just "<name>".
+        bool is_flat = fs::path(source).filename().string().starts_with(fs::path(part_dir).filename().string() + ".");
+
+        auto destination = is_flat
+            ? create(volume, root_path, part_dir_without_slash.string() + "." + proj_name, /*initialize=*/ true)
+            : create(volume, to, proj_name, /*initialize=*/ true);
+
+        all_projections.emplace(
+            proj_name,
+            ProjectionToRemove{
+                is_flat,
+                std::move(source),
+                strip_trailing_slash(destination->getRelativePath()),
+                destination});
+    };
+    for (const auto & projection : projections)
+        update_projection_info(projection.name + projection_suffix);
+    for (const auto & [name, _] : checksums.files)
+        if (endsWith(name, projection_suffix))
+            update_projection_info(name);
+
+    if (!has_delete_prefix)
+    {
+        for (const auto & [_, projection] : all_projections)
         {
-            if (!path.empty() && path.back() == '/')
-                path.pop_back();
-            return path;
-        };
-        auto update_projection_info = [&](const String & proj_name)
-        {
-            if (all_projections.contains(proj_name))
-                return;
-            auto projection_storage = getProjection(proj_name);
-            if (!projection_storage->exists())
-                return;
+            if (!projection.is_flat || !disk->existsDirectory(projection.destination))
+                continue;
 
-            String source = strip_trailing_slash(projection_storage->getRelativePath());
-            /// A flat sibling dir is "<part_dir>.<name>"; a nested child is just "<name>".
-            bool is_flat = fs::path(source).filename().string().starts_with(fs::path(part_dir).filename().string() + ".");
-
-            auto destination = is_flat
-                ? create(volume, root_path, part_dir_without_slash.string() + "." + proj_name, /*initialize=*/ true)
-                : create(volume, to, proj_name, /*initialize=*/ true);
-
-            all_projections.emplace(
-                proj_name,
-                ProjectionToRemove{
-                    is_flat,
-                    std::move(source),
-                    strip_trailing_slash(destination->getRelativePath()),
-                    destination});
-        };
-        for (const auto & projection : projections)
-            update_projection_info(projection.name + projection_suffix);
-        for (const auto & [name, _] : checksums.files)
-            if (endsWith(name, projection_suffix))
-                update_projection_info(name);
+            LOG_WARNING(log, "Directory {} (to which projection must be renamed before removing) already exists. "
+                        "Most likely this is due to unclean restart or race condition. Removing it.", fullPath(disk, projection.destination));
+            disk->removeSharedRecursive(
+                fs::path(projection.destination) / "", !can_remove_description->can_remove_anything, can_remove_description->files_not_to_remove);
+        }
 
         try
         {
             disk->moveDirectory(from, to);
-
-            for (const auto & [_, projection] : all_projections)
-                if (projection.is_flat)
-                    disk->moveDirectory(projection.source, projection.destination);
             /// NOTE: we intentionally don't update part_dir here because it would cause a data race
             /// with concurrent readers (e.g. system.parts table queries calling getFullPath()).
             /// The part is being removed anyway, so the path doesn't need to be updated.
@@ -1110,6 +1221,31 @@ void DataPartStorageOnDiskBase::remove(
                 return;
             }
             throw;
+        }
+
+        /// The parent is already at its delete_tmp_ name: an individually missing sibling (removed by a
+        /// concurrent cleaner or manually) must not abort the cleanup.
+        for (const auto & [_, projection] : all_projections)
+        {
+            if (!projection.is_flat)
+                continue;
+
+            try
+            {
+                disk->moveDirectory(projection.source, projection.destination);
+            }
+            catch (const Exception & e)
+            {
+                if (e.code() != ErrorCodes::FILE_DOESNT_EXIST)
+                    throw;
+                LOG_WARNING(log, "Projection directory {} doesn't exist while removing part. Ignoring.", fullPath(disk, projection.source));
+            }
+            catch (const fs::filesystem_error & e)
+            {
+                if (e.code() != std::errc::no_such_file_or_directory)
+                    throw;
+                LOG_WARNING(log, "Projection directory {} doesn't exist while removing part. Ignoring.", fullPath(disk, projection.source));
+            }
         }
     }
 

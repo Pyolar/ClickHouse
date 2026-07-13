@@ -126,7 +126,7 @@ public:
     virtual bool hasProjection(const std::string & name) const = 0;
 
     /// Layout used when this storage creates a projection directory
-    virtual ProjectionStorageFormat getProjectionStorageFormat() const { return ProjectionStorageFormat::LEGACY_NESTED; }
+    virtual ProjectionStorageFormat getProjectionStorageFormat() const = 0;
 
     /// Configure the layout for projection directories this storage will create
     virtual void setProjectionStorageFormat(ProjectionStorageFormat format) = 0;
@@ -301,6 +301,8 @@ public:
         bool make_source_readonly = false;
         DiskTransactionPtr external_transaction = nullptr;
         std::optional<int32_t> metadata_version_to_write = std::nullopt;
+        /// FLAT projection siblings owned by the part (logical `p.proj` names); nullopt - copy every detected sibling.
+        std::optional<NameSet> projections_to_copy = std::nullopt;
     };
 
     virtual std::shared_ptr<IDataPartStorage> freeze(
@@ -376,12 +378,16 @@ public:
     /// Ideally, new_root_path should be the same as current root (but it is not true).
     /// Examples are: 'all_1_2_1' -> 'detached/all_1_2_1'
     ///               'moving/tmp_all_1_2_1' -> 'all_1_2_1'
+    /// The parent dir move commits the part at its new name, so when entering the live namespace it
+    /// goes last (after FLAT projection siblings) and when leaving the live namespace it goes first:
+    /// a crash may strand parentless siblings (garbage), never a live parent without its siblings.
     virtual void rename(
         std::string new_root_path,
         std::string new_part_dir,
         LoggerPtr log,
         bool remove_new_dir_if_exists,
-        bool fsync_part_dir) = 0;
+        bool fsync_part_dir,
+        bool parent_moves_first) = 0;
 
     /// Starts a transaction of mutable operations.
     virtual void beginTransaction() = 0;

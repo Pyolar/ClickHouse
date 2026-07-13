@@ -167,7 +167,8 @@ public:
         std::string new_part_dir,
         LoggerPtr log,
         bool remove_new_dir_if_exists,
-        bool fsync_part_dir) override;
+        bool fsync_part_dir,
+        bool parent_moves_first) override;
 
     void remove(
         CanRemoveCallback && can_remove_callback,
