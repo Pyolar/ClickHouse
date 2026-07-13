@@ -73,7 +73,7 @@ namespace
     }
 
 
-    bool parseToGrantees(IParser::Pos & pos, Expected & expected, bool is_revoke, boost::intrusive_ptr<ASTRolesOrUsersSet> & grantees)
+    bool parseToGrantees(IParser::Pos & pos, Expected & expected, bool is_revoke, bool allow_query_parameter, boost::intrusive_ptr<ASTRolesOrUsersSet> & grantees)
     {
         return IParserBase::wrapParseImpl(pos, [&]
         {
@@ -82,7 +82,7 @@ namespace
 
             ASTPtr ast;
             ParserRolesOrUsersSet roles_p;
-            roles_p.allowRoles().allowUsers().allowCurrentUser().allowAll(is_revoke).allowQueryParameters();
+            roles_p.allowRoles().allowUsers().allowCurrentUser().allowAll(is_revoke).allowQueryParameters(allow_query_parameter);
             if (!roles_p.parse(pos, ast, expected))
                 return false;
 
@@ -149,7 +149,7 @@ bool ParserGrantQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
         parseOnCluster(pos, expected, cluster);
 
     boost::intrusive_ptr<ASTRolesOrUsersSet> grantees;
-    if (!parseToGrantees(pos, expected, is_revoke, grantees) && !allow_no_grantees)
+    if (!parseToGrantees(pos, expected, is_revoke, /*allow_query_parameter=*/ !attach_mode, grantees) && !allow_no_grantees)
         return false;
 
     if (cluster.empty())

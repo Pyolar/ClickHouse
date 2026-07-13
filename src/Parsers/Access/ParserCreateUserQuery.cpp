@@ -584,7 +584,9 @@ bool ParserCreateUserQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expec
     }
 
     ASTPtr names_ast;
-    if (!ParserUserNamesWithHost(/*allow_query_parameter=*/true, /*parse_host_pattern=*/true).parse(pos, names_ast, expected))
+    /// Attach-mode queries (DiskAccessStorage files) are never passed through ReplaceQueryParameterVisitor,
+    /// so a query parameter there must be rejected at parse time.
+    if (!ParserUserNamesWithHost(/*allow_query_parameter=*/ !attach_mode, /*parse_host_pattern=*/ true).parse(pos, names_ast, expected))
         return false;
     auto names = boost::static_pointer_cast<ASTUserNamesWithHost>(names_ast);
 
