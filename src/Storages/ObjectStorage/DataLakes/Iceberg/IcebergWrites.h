@@ -48,7 +48,6 @@ String stringifyJSON(const Poco::Dynamic::Var & json, unsigned indent = 0);
 
 void generateManifestFile(
     Poco::JSON::Object::Ptr metadata,
-    const std::vector<String> & partition_columns,
     const std::vector<Field> & partition_values,
     const DataTypes & partition_types,
     const std::vector<Iceberg::IcebergPathFromMetadata> & data_file_names,

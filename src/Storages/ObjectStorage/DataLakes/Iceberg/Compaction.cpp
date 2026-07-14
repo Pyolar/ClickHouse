@@ -467,12 +467,7 @@ static void writeMetadataFiles(
             }
         }
 
-        std::vector<String> partition_columns;
         auto fields_from_partition_spec = partititon_spec->getArray(f_fields);
-        for (UInt32 i = 0; i < fields_from_partition_spec->size(); ++i)
-        {
-            partition_columns.push_back(fields_from_partition_spec->getObject(i)->getValue<String>(f_name));
-        }
 
         for (auto & [manifest_entry, data_filenames] : grouped_by_manifest_files_result)
         {
@@ -508,7 +503,6 @@ static void writeMetadataFiles(
             }
             generateManifestFile(
                 metadata_object,
-                partition_columns,
                 plan.partition_encoder.getPartitionValue(grouped_by_manifest_files_partitions[manifest_entry]),
                 ChunkPartitioner(fields_from_partition_spec, current_schema->getArray(Iceberg::f_fields), context, sample_block_).getResultTypes(),
                 data_files_vec,

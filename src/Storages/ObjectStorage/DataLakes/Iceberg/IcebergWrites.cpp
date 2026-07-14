@@ -201,25 +201,28 @@ avro::GenericDatum convertToAvro(const Field & field, const DataTypePtr & type)
 }
 
 /// Encode one partition tuple (a vector of `Field`s, in spec order) into the
-/// manifest entry's `partition` Avro record.
+/// manifest entry's `partition` Avro record. `partition_field_names` are the
+/// field names of the persisted partition spec (see `extendSchemaForPartitions`),
+/// which the Avro record schema is built from — they may differ from the source
+/// column names (for transforms, or after a `RENAME COLUMN`).
 void writePartitionRecord(
     avro::GenericRecord & partition_record,
-    const std::vector<String> & partition_columns,
+    const std::vector<String> & partition_field_names,
     const std::vector<Field> & partition_values,
     const DataTypes & partition_types)
 {
-    for (size_t i = 0; i < partition_columns.size(); ++i)
+    for (size_t i = 0; i < partition_field_names.size(); ++i)
     {
         const bool is_null_value = partition_values[i].getType() == Field::Types::Null;
         const bool is_nullable_partition = partition_types[i]->isNullable();
 
         if (!is_nullable_partition && is_null_value)
             throw Exception(
-                ErrorCodes::BAD_ARGUMENTS, "Got NULL partition value for non-nullable partition column {}", partition_columns[i]);
+                ErrorCodes::BAD_ARGUMENTS, "Got NULL partition value for non-nullable partition field {}", partition_field_names[i]);
 
         if (!is_nullable_partition)
         {
-            partition_record.field(partition_columns[i]) = convertToAvro(partition_values[i], partition_types[i]);
+            partition_record.field(partition_field_names[i]) = convertToAvro(partition_values[i], partition_types[i]);
             continue;
         }
 
@@ -228,11 +231,11 @@ void writePartitionRecord(
         /// See issue #105852: before this change, NULL partition values were
         /// silently written as 0 because the schema was non-nullable.
         size_t field_index = 0;
-        if (!partition_record.schema()->nameIndex(partition_columns[i], field_index))
+        if (!partition_record.schema()->nameIndex(partition_field_names[i], field_index))
             throw Exception(
                 ErrorCodes::BAD_ARGUMENTS,
                 "Partition field {} not found in manifest schema",
-                partition_columns[i]);
+                partition_field_names[i]);
 
         const avro::NodePtr & union_schema = partition_record.schema()->leafAt(static_cast<UInt32>(field_index));
 
@@ -246,7 +249,7 @@ void writePartitionRecord(
             union_field.selectBranch(1);
             union_field.datum() = convertToAvro(partition_values[i], partition_types[i]);
         }
-        partition_record.field(partition_columns[i]) = avro::GenericDatum(union_schema, union_field);
+        partition_record.field(partition_field_names[i]) = avro::GenericDatum(union_schema, union_field);
     }
 }
 
@@ -364,27 +367,29 @@ String stringifyJSON(const Poco::Dynamic::Var & json, unsigned indent)
 
 static void extendSchemaForPartitions(
     String & schema,
-    const std::vector<String> & partition_columns,
     const DataTypes & partition_types,
     const Poco::JSON::Array::Ptr & partition_spec_fields)
 {
-    /// The manifest's `partition` struct must use the SAME field-ids as the table's partition
-    /// spec: Iceberg projects the manifest partition values onto the spec by field-id. The ids
-    /// are not a fixed `1000 + i` offset — they depend on who created the table (ClickHouse and
-    /// Spark start numbering differently), so read them from the actual persisted spec.
-    if (partition_spec_fields->size() != partition_columns.size())
+    /// The manifest's `partition` struct must mirror the table's partition spec: Iceberg projects
+    /// the manifest partition values onto the spec by field-id, and engines reading the manifest
+    /// expect the spec's field names. Neither is derivable from the source columns — the ids are
+    /// not a fixed `1000 + i` offset (ClickHouse and Spark start numbering differently) and the
+    /// names differ from the source column names for transforms (e.g. `id` -> `id_bucket`) or after
+    /// a `RENAME COLUMN`. So take both from the actual persisted spec.
+    if (partition_spec_fields->size() != partition_types.size())
         throw Exception(
             ErrorCodes::LOGICAL_ERROR,
-            "Partition spec has {} fields but {} partition columns were provided",
+            "Partition spec has {} fields but {} partition types were provided",
             partition_spec_fields->size(),
-            partition_columns.size());
+            partition_types.size());
 
     Poco::JSON::Array::Ptr partition_fields = new Poco::JSON::Array;
-    for (size_t i = 0; i < partition_columns.size(); ++i)
+    for (size_t i = 0; i < partition_types.size(); ++i)
     {
+        const auto spec_field = partition_spec_fields->getObject(static_cast<UInt32>(i));
         Poco::JSON::Object::Ptr field = new Poco::JSON::Object;
-        field->set(Iceberg::f_field_id, partition_spec_fields->getObject(static_cast<UInt32>(i))->getValue<Int32>(Iceberg::f_field_id));
-        field->set(Iceberg::f_name, partition_columns[i]);
+        field->set(Iceberg::f_field_id, spec_field->getValue<Int32>(Iceberg::f_field_id));
+        field->set(Iceberg::f_name, spec_field->getValue<String>(Iceberg::f_name));
         field->set(Iceberg::f_type, getAvroType(partition_types[i]));
         partition_fields->add(field);
     }
@@ -438,7 +443,6 @@ Poco::JSON::Object::Ptr getCurrentSchema(const Poco::JSON::Object::Ptr & metadat
 
 void generateManifestFile(
     Poco::JSON::Object::Ptr metadata,
-    const std::vector<String> & partition_columns,
     const std::vector<Field> & partition_values,
     const DataTypes & partition_types,
     const std::vector<IcebergPathFromMetadata> & data_file_names,
@@ -463,7 +467,16 @@ void generateManifestFile(
     else
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unsupported iceberg format-version {}", version);
 
-    extendSchemaForPartitions(schema_representation, partition_columns, partition_types, partition_spec->getArray(Iceberg::f_fields));
+    /// The manifest `partition` struct is described by the persisted partition spec, not by the
+    /// source columns. Take the field names from the spec so that the written manifest matches the
+    /// table's own partition spec even when they differ (transforms, or a renamed source column).
+    const auto partition_spec_fields = partition_spec->getArray(Iceberg::f_fields);
+    std::vector<String> partition_field_names;
+    partition_field_names.reserve(partition_spec_fields->size());
+    for (size_t i = 0; i < partition_spec_fields->size(); ++i)
+        partition_field_names.push_back(partition_spec_fields->getObject(static_cast<UInt32>(i))->getValue<String>(Iceberg::f_name));
+
+    extendSchemaForPartitions(schema_representation, partition_types, partition_spec_fields);
     auto schema = avro::compileJsonSchemaFromString(schema_representation);
 
     const avro::NodePtr & root_schema = schema.root(); // NOLINT
@@ -552,7 +565,7 @@ void generateManifestFile(
         data_file.field(Iceberg::f_record_count) = avro::GenericDatum(static_cast<Int64>(data_file_row_counts[file_idx]));
         data_file.field(Iceberg::f_file_size_in_bytes) = avro::GenericDatum(static_cast<Int64>(data_file_byte_counts[file_idx]));
         avro::GenericRecord & partition_record = data_file.field("partition").value<avro::GenericRecord>();
-        writePartitionRecord(partition_record, partition_columns, partition_values, partition_types);
+        writePartitionRecord(partition_record, partition_field_names, partition_values, partition_types);
 
         writer.write(manifest_datum);
     }
@@ -1104,7 +1117,6 @@ bool IcebergStorageSink::initializeMetadata()
             {
                 generateManifestFile(
                     metadata,
-                    partitioner ? partitioner->getColumns() : std::vector<String>{},
                     partition_key,
                     partitioner ? partitioner->getResultTypes() : DataTypes{},
                     writer.getDataFiles(),
