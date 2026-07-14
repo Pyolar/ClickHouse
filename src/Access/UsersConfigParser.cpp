@@ -1,4 +1,5 @@
 #include <Access/UsersConfigParser.h>
+#include <Access/AccessEntityIO.h>
 #include <Access/Quota.h>
 #include <Access/RowPolicy.h>
 #include <Access/User.h>
@@ -61,6 +62,8 @@ namespace
 
         if (!ast)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Failed to parse grant query. Error: {}", error_message);
+
+        checkAccessEntityHasNoQueryParameters(ast);
 
         auto & query = ast->as<ASTGrantQuery &>();
 

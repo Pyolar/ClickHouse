@@ -1,6 +1,7 @@
 #include <Parsers/QueryParameterVisitor.h>
 #include <Parsers/ASTQueryParameter.h>
 #include <Parsers/ASTSetQuery.h>
+#include <Parsers/ASTWithAlias.h>
 #include <Parsers/FieldFromAST.h>
 #include <Parsers/ParserQuery.h>
 #include <Parsers/parseQuery.h>
@@ -27,6 +28,11 @@ public:
             visitSetQuery(*set_query);
         else
         {
+            /// A parametrized alias (`expr AS {name:Identifier}`) is stored as a member
+            /// rather than as a child and must be discovered here explicitly.
+            if (const auto * with_alias = dynamic_cast<const ASTWithAlias *>(ast.get()); with_alias && with_alias->parametrised_alias)
+                visitQueryParameter(*with_alias->parametrised_alias);
+
             for (const auto & child : ast->children)
                 visit(child);
         }

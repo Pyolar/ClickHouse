@@ -54,12 +54,12 @@ namespace
     }
 
 
-    bool parseRoles(IParser::Pos & pos, Expected & expected, bool is_revoke, bool id_mode, bool allow_query_parameter, boost::intrusive_ptr<ASTRolesOrUsersSet> & roles)
+    bool parseRoles(IParser::Pos & pos, Expected & expected, bool is_revoke, bool id_mode, boost::intrusive_ptr<ASTRolesOrUsersSet> & roles)
     {
         return IParserBase::wrapParseImpl(pos, [&]
         {
             ParserRolesOrUsersSet roles_p;
-            roles_p.allowRoles().useIDMode(id_mode).allowQueryParameters(allow_query_parameter);
+            roles_p.allowRoles().useIDMode(id_mode).allowQueryParameters();
             if (is_revoke)
                 roles_p.allowAll();
 
@@ -73,7 +73,7 @@ namespace
     }
 
 
-    bool parseToGrantees(IParser::Pos & pos, Expected & expected, bool is_revoke, bool allow_query_parameter, boost::intrusive_ptr<ASTRolesOrUsersSet> & grantees)
+    bool parseToGrantees(IParser::Pos & pos, Expected & expected, bool is_revoke, boost::intrusive_ptr<ASTRolesOrUsersSet> & grantees)
     {
         return IParserBase::wrapParseImpl(pos, [&]
         {
@@ -82,7 +82,7 @@ namespace
 
             ASTPtr ast;
             ParserRolesOrUsersSet roles_p;
-            roles_p.allowRoles().allowUsers().allowCurrentUser().allowAll(is_revoke).allowQueryParameters(allow_query_parameter);
+            roles_p.allowRoles().allowUsers().allowCurrentUser().allowAll(is_revoke).allowQueryParameters();
             if (!roles_p.parse(pos, ast, expected))
                 return false;
 
@@ -138,10 +138,7 @@ bool ParserGrantQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
     }
     else
     {
-        /// Query parameters are not substituted in attach-mode queries (DiskAccessStorage) and in queries
-        /// from the users.xml config, and the granted-role names are resolved there without substitution.
-        if (!parseAccessRightsElementsWithoutOptions(pos, expected, elements)
-            && !parseRoles(pos, expected, is_revoke, attach_mode, /*allow_query_parameter=*/ !attach_mode && !allow_no_grantees, roles))
+        if (!parseAccessRightsElementsWithoutOptions(pos, expected, elements) && !parseRoles(pos, expected, is_revoke, attach_mode, roles))
             return false;
     }
 
@@ -149,7 +146,7 @@ bool ParserGrantQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
         parseOnCluster(pos, expected, cluster);
 
     boost::intrusive_ptr<ASTRolesOrUsersSet> grantees;
-    if (!parseToGrantees(pos, expected, is_revoke, /*allow_query_parameter=*/ !attach_mode, grantees) && !allow_no_grantees)
+    if (!parseToGrantees(pos, expected, is_revoke, grantees) && !allow_no_grantees)
         return false;
 
     if (cluster.empty())
