@@ -2250,16 +2250,17 @@ private:
             }
         }
 
-        /// Hardlink unchanged projections (layout-independent discovery: nested children or flat siblings)
-        for (auto proj = ctx->source_part->getDataPartStorage().iterateProjections(false); proj->isValid(); proj->next())
+        /// Hardlink unchanged projections. getProjections() is the owned set (layout-independent),
+        /// so residue siblings of an unrelated same-named part are not carried into the new part.
+        for (const auto & [projection_dir, entry] : ctx->source_part->getDataPartStorage().getProjections())
         {
-            if (!entries_to_hardlink.contains(proj->name()))
+            if (entry.is_temp || !entries_to_hardlink.contains(projection_dir))
                 continue;
 
-            ctx->new_data_part->getDataPartStorage().createProjection(proj->name());
+            ctx->new_data_part->getDataPartStorage().createProjection(projection_dir);
 
-            auto projection_data_part_storage_src = ctx->source_part->getDataPartStorage().getProjection(proj->name());
-            auto projection_data_part_storage_dst = ctx->new_data_part->getDataPartStorage().getProjection(proj->name());
+            auto projection_data_part_storage_src = ctx->source_part->getDataPartStorage().getProjection(projection_dir);
+            auto projection_data_part_storage_dst = ctx->new_data_part->getDataPartStorage().getProjection(projection_dir);
 
             for (auto p_it = projection_data_part_storage_src->iterate(); p_it->isValid(); p_it->next())
             {
@@ -2268,7 +2269,7 @@ private:
 
                 /// The zero-copy keep-list uses the logical projection dir name
                 /// regardless of the on-disk projection layout.
-                hardlinked_files.insert(fs::path(proj->name()) / p_it->name());
+                hardlinked_files.insert(fs::path(projection_dir) / p_it->name());
             }
         }
 
@@ -2551,13 +2552,13 @@ private:
             }
         }
 
-        /// Hardlink unchanged projections (layout-independent discovery: nested children or flat siblings)
-        for (auto proj = ctx->source_part->getDataPartStorage().iterateProjections(false); proj->isValid(); proj->next())
+        /// Hardlink unchanged projections. getProjections() is the owned set (layout-independent).
+        for (const auto & [projection_dir, entry] : ctx->source_part->getDataPartStorage().getProjections())
         {
-            const String projection_dir = proj->name();
             /// Same ownership rule as the checksums-driven mutate path: a discovered directory the
             /// source part does not reference must not be carried into the new part.
-            if (ctx->files_to_skip.contains(projection_dir)
+            if (entry.is_temp
+                || ctx->files_to_skip.contains(projection_dir)
                 || !ctx->source_part->checksums.has(projection_dir))
                 continue;
 

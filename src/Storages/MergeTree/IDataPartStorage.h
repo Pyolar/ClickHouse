@@ -9,6 +9,7 @@
 #include <base/types.h>
 #include <Common/TransactionID.h>
 
+#include <map>
 #include <memory>
 #include <optional>
 
@@ -55,9 +56,6 @@ public:
 };
 
 using DataPartStorageIteratorPtr = std::unique_ptr<IDataPartStorageIterator>;
-
-class IDataPartProjectionIterator;
-using DataPartProjectionIteratorPtr = std::unique_ptr<IDataPartProjectionIterator>;
 
 struct MergeTreeDataPartChecksums;
 
@@ -122,6 +120,33 @@ public:
     /// Can add it if needed                             ///                          'database/table/moving'
     /// virtual std::string getRelativeRootPath() const = 0;
 
+    /// One projection sub-part. Paths are derived (see getProjectionStorageRootAndDir), never stored, so
+    /// entries survive a rename. NESTED: <root>/<part_dir>/<name>; FLAT: <root>/<part_dir>.<name>.
+    struct ProjectionEntry
+    {
+        ProjectionStorageFormat format;
+        bool is_temp;   /// derivable from the key's ".tmp_proj" suffix; cached so consumers need not parse
+    };
+    /// Key: logical projection dir basename as in the NESTED layout ("p.proj", "p.tmp_proj") -- the
+    /// same string passed to getProjection/hasProjection, so call sites need no translation.
+    using ProjectionEntries = std::map<String, ProjectionEntry, std::less<>>;
+
+    /// Projections this storage knows it has: the owned set when seeded by the part at load (residue of an
+    /// unrelated same-named part excluded), else a one-time disk scan. Authoritative after; returned by value.
+    virtual ProjectionEntries getProjections() const = 0;
+
+    /// Raw scan of the on-disk projection dirs across both layouts, residue included. Does not touch
+    /// the cache. For manifest-less paths only (checksums reconstruction, part consistency checks).
+    virtual ProjectionEntries detectProjections() const = 0;
+
+    /// Register a projection this part owns and mark the cache authoritative. Used to seed from the
+    /// manifest at load, and by getProjection/createProjection when a new projection dir is created.
+    virtual void addProjectionEntry(const std::string & name, ProjectionEntry entry) = 0;
+
+    /// Mark the projection cache authoritative even when empty, so getProjections() will not fall
+    /// back to a disk scan. Called at the end of the part's projection seeding.
+    virtual void setProjectionsReady() = 0;
+
     /// Checks whether part has projection
     virtual bool hasProjection(const std::string & name) const = 0;
 
@@ -149,10 +174,6 @@ public:
 
     /// Iterate part directory. Iteration in subdirectory is not needed yet.
     virtual DataPartStorageIteratorPtr iterate() const = 0;
-
-    /// Iterate this part's projection sub-part dirs across layouts (nested children + flat siblings).
-    /// No default on `include_temp`: clang-tidy `google-default-arguments` forbids defaults on virtuals.
-    virtual DataPartProjectionIteratorPtr iterateProjections(bool include_temp) const = 0;
 
     /// Get metadata for a file inside path dir.
     virtual Poco::Timestamp getFileLastModified(const std::string & file_name) const = 0;
@@ -265,9 +286,8 @@ public:
     /// Create a backup of a data part.
     /// This method adds a new entry to backup_entries.
     /// Also creates a new tmp_dir for internal disk (if disk is mentioned the first time).
-    /// `part_dir_in_backup` is the directory name for this part inside the backup; empty means
-    /// the on-disk part directory name. Projection parts pass their logical name ("<name>.proj")
-    /// so the backup layout does not depend on the on-disk projection layout.
+    /// A projection storage backs up under its logical name ("<name>.proj") regardless of the
+    /// on-disk projection layout, so the backup layout is layout-independent (see getProjection).
     using TemporaryFilesOnDisks = std::map<DiskPtr, std::shared_ptr<TemporaryFileOnDisk>>;
     virtual void backup(
         const MergeTreeDataPartChecksums & checksums,
@@ -278,8 +298,7 @@ public:
         BackupEntries & backup_entries,
         TemporaryFilesOnDisks * temp_dirs,
         bool is_projection_part,
-        bool allow_backup_broken_projection,
-        const String & part_dir_in_backup) const = 0;
+        bool allow_backup_broken_projection) const = 0;
 
     /// Creates hardlinks into 'to/dir_path' for every file in data part.
     /// Some files can be copied instead of hardlinks. It's because of details of zero copy replication
@@ -301,8 +320,6 @@ public:
         bool make_source_readonly = false;
         DiskTransactionPtr external_transaction = nullptr;
         std::optional<int32_t> metadata_version_to_write = std::nullopt;
-        /// FLAT projection siblings owned by the part (logical `p.proj` names); nullopt - copy every detected sibling.
-        std::optional<NameSet> projections_to_copy = std::nullopt;
     };
 
     virtual std::shared_ptr<IDataPartStorage> freeze(
@@ -330,10 +347,7 @@ public:
         const ReadSettings & read_settings,
         const WriteSettings & write_settings,
         LoggerPtr log,
-        const std::function<void()> & cancellation_hook,
-        /// FLAT projection siblings owned by the part (logical `p.proj` names);
-        /// nullopt - copy every detected sibling.
-        const std::optional<NameSet> & projections_to_copy
+        const std::function<void()> & cancellation_hook
         ) const = 0;
 
     /// Change part's root. from_root should be a prefix path of current root path.
@@ -381,16 +395,14 @@ public:
     /// Ideally, new_root_path should be the same as current root (but it is not true).
     /// Examples are: 'all_1_2_1' -> 'detached/all_1_2_1'
     ///               'moving/tmp_all_1_2_1' -> 'all_1_2_1'
-    /// The parent dir move commits the part at its new name, so when entering the live namespace it
-    /// goes last (after FLAT projection siblings) and when leaving the live namespace it goes first:
-    /// a crash may strand parentless siblings (garbage), never a live parent without its siblings.
+    /// FLAT projection siblings move with the part dir; rename picks the parent/sibling order from the
+    /// destination (parent last when entering the live namespace, first when leaving it).
     virtual void rename(
         std::string new_root_path,
         std::string new_part_dir,
         LoggerPtr log,
         bool remove_new_dir_if_exists,
-        bool fsync_part_dir,
-        bool parent_moves_first) = 0;
+        bool fsync_part_dir) = 0;
 
     /// Starts a transaction of mutable operations.
     virtual void beginTransaction() = 0;
@@ -408,25 +420,6 @@ public:
 
 using DataPartStoragePtr = std::shared_ptr<const IDataPartStorage>;
 using MutableDataPartStoragePtr = std::shared_ptr<IDataPartStorage>;
-
-/// Cursor over a part's projection sub-part directories, normalized across on-disk layouts
-class IDataPartProjectionIterator
-{
-public:
-    virtual void next() = 0;
-    virtual bool isValid() const = 0;
-
-    /// Logical, layout-independent name (e.g. "p.proj")
-    virtual std::string name() const = 0;
-    /// On-disk basename (flat: "<part_dir>.p.proj")
-    virtual std::string realName() const = 0;
-    /// Dir on disk is rootPath()/realName()
-    virtual std::string rootPath() const = 0;
-    virtual IDataPartStorage::ProjectionStorageFormat format() const = 0;
-    virtual bool isTemp() const = 0;
-
-    virtual ~IDataPartProjectionIterator() = default;
-};
 
 /// A holder that encapsulates data part storage and
 /// gives access to const storage from const methods

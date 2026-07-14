@@ -85,8 +85,6 @@ private:
         const std::string & name,
         const ReadSettings & settings,
         std::optional<size_t> read_hint) const override;
-
-    IDataPartStorage::ProjectionStorageFormat detectProjectionAndItsFormat(const std::string & name) const;
 };
 
 }

@@ -318,12 +318,13 @@ static IMergeTreeDataPart::Checksums checkDataPart(
         assertEOF(*buf);
     }
 
-    /// Projections may be stored either nested inside the part directory or as flat
-    /// siblings of it, so collect them across both layouts, by their logical names.
+    /// Projections may be nested inside the part dir or flat siblings of it; detectProjections collects
+    /// both by logical name. Disk truth (the part is being verified), so scan rather than read the cache.
     NameSet projections_on_disk;
     if (!data_part->isProjectionPart())
-        for (auto proj = data_part_storage.iterateProjections(false); proj->isValid(); proj->next())
-            projections_on_disk.insert(proj->name());
+        for (const auto & [projection_name, entry] : data_part_storage.detectProjections())
+            if (!entry.is_temp)
+                projections_on_disk.insert(projection_name);
 
     const auto & checksums_txt_files = checksums_txt.files;
     for (auto it = data_part_storage.iterate(); it->isValid(); it->next())

@@ -22,7 +22,10 @@ public:
         std::string root_path_,
         std::string part_dir_);
 
-    DataPartProjectionIteratorPtr iterateProjections(bool include_temp) const override;
+    ProjectionEntries getProjections() const override;
+    ProjectionEntries detectProjections() const override;
+    void addProjectionEntry(const std::string & name, ProjectionEntry entry) override;
+    void setProjectionsReady() override;
 
     ProjectionStorageFormat getProjectionStorageFormat() const override { return projection_storage_format; }
     void setProjectionStorageFormat(ProjectionStorageFormat format) override
@@ -132,8 +135,7 @@ public:
         BackupEntries & backup_entries,
         TemporaryFilesOnDisks * temp_dirs,
         bool is_projection_part,
-        bool allow_backup_broken_projection,
-        const String & part_dir_in_backup) const override;
+        bool allow_backup_broken_projection) const override;
 
     MutableDataPartStoragePtr freeze(
         const std::string & to,
@@ -159,8 +161,7 @@ public:
         const ReadSettings & read_settings,
         const WriteSettings & write_settings,
         LoggerPtr log,
-        const std::function<void()> & cancellation_hook,
-        const std::optional<NameSet> & projections_to_copy
+        const std::function<void()> & cancellation_hook
         ) const override;
 
     void rename(
@@ -168,8 +169,7 @@ public:
         std::string new_part_dir,
         LoggerPtr log,
         bool remove_new_dir_if_exists,
-        bool fsync_part_dir,
-        bool parent_moves_first) override;
+        bool fsync_part_dir) override;
 
     void remove(
         CanRemoveCallback && can_remove_callback,
@@ -204,6 +204,10 @@ protected:
         std::string root_path_,
         std::string part_dir_,
         bool initialize_) const = 0;
+
+    /// {root, dir} of a projection's on-disk location for a layout, derived from the part's current
+    /// root_path/part_dir. Single source of truth, so ProjectionEntry need store only the format.
+    std::pair<std::string, std::string> getProjectionStorageRootAndDir(const std::string & name, ProjectionStorageFormat format) const;
 
     /// Lazily load the per-part skp_idx.packed archive (if any), reading it as a standalone disk
     /// file. Subsequent calls return the cached reader, or nullptr when there is no such file --
@@ -258,6 +262,16 @@ protected:
 
     /// Layout for projection directories created through this storage.
     ProjectionStorageFormat projection_storage_format = ProjectionStorageFormat::NONE;
+
+    /// Logical projection name ("<name>.proj") when this storage is a projection sub-part; empty
+    /// otherwise. Set by getProjection so backup() can write under the layout-independent name.
+    std::string projection_logical_name;
+
+    /// Cached projection entries. ready=false: never scanned; ready=true: authoritative (absent key = no
+    /// projection). Seeded from the manifest at load (owned set); paths derived, so only setRelativePath drops it.
+    mutable std::mutex projection_entries_mutex;
+    mutable bool projection_entries_ready TSA_GUARDED_BY(projection_entries_mutex) = false;
+    mutable ProjectionEntries projection_entries TSA_GUARDED_BY(projection_entries_mutex);
 
     /// Cached probe state for skp_idx.packed. probed=false means we haven't checked the disk yet;
     /// probed=true with reader=null means we checked and the archive isn't present.

@@ -245,12 +245,8 @@ def test_replicated_fetch_flat_layout():
     assert proj_query("t_repl", node2) == proj_query("t_repl", node)
 
 
-# Issue #6: CHECK TABLE must classify an unknown flat projection (left over after
-# DROP PROJECTION on a detached part) the same way as a nested one: a projection
-# problem ("unexpected projection directories"), not a broken part. The nested-only
-# directory scan misses flat siblings, so the stale "p.proj" checksums entry is
-# never cleaned and the whole part is reported broken; on ReplicatedMergeTree the
-# part-check thread would then detach the part and try to re-fetch it.
+# CHECK TABLE must classify an unknown flat projection (left after DROP PROJECTION on a detached part)
+# as a projection problem, not a broken part - the nested-only scan misses flat siblings.
 def test_check_table_after_dropped_projection():
     for tname, extra in (
         ("t_chk_nested", ""),
@@ -270,10 +266,8 @@ def test_check_table_after_dropped_projection():
 
 
 
-# Issues #7 and #8: DETACH/ATTACH moves the part under detached/; the flat sibling must follow,
-# both on disk and in the in-memory projection storage. After ATTACH PART the projection part's
-# root must point at the attached location, not at detached/<part>.p.proj, and the projection
-# must stay usable without a silent fallback to the parent part.
+# DETACH/ATTACH moves the part under detached/; the flat sibling must follow on disk and in memory.
+# After ATTACH PART the projection part's root must point at the attached location, not detached/.
 # @pytest.mark.xfail(reason=REVIEW + "3473543140", strict=False)
 def test_detach_attach_flat_part():
     setup_table("t_da", "projection_storage_format = 'flat'")
@@ -298,11 +292,8 @@ def test_detach_attach_flat_part():
     )
 
 
-# Issue #12: reloading a part must not mark a present flat projection as broken.
-# The consistency check resolves the "p.proj" checksums entry by probing a nested
-# directory under the part dir, so a flat sibling is reported missing on every
-# load (server restart, DETACH/ATTACH TABLE) and the projection is silently
-# marked broken; queries then fall back to the parent part.
+# Reloading a part must not mark a present flat projection broken: the consistency check probed a
+# nested dir for the "p.proj" entry, so a flat sibling was reported missing and silently marked broken.
 # @pytest.mark.xfail(reason=REVIEW + "3481208077", strict=False)
 def test_flat_projection_not_broken_on_reload():
     setup_table("t_consist", "projection_storage_format = 'flat'")
@@ -317,11 +308,8 @@ def test_flat_projection_not_broken_on_reload():
     )
 
 
-# Issue #9: BACKUP/RESTORE must store and find flat projection data. Projections
-# must be serialized under their logical name (<part>/p.proj/...), so backups are
-# layout-independent: any version can restore them, and restore of an old backup
-# keeps working. With the physical sibling name (<part>/<part>.p.proj/...) restore
-# recreates a bogus nested directory and the part loads broken.
+# BACKUP/RESTORE must store and find flat projection data under the logical name (<part>/p.proj/...),
+# so backups are layout-independent; the physical sibling name would restore a bogus nested dir.
 def test_backup_restore_flat():
     setup_table("t_bk", "projection_storage_format = 'flat'")
     baseline = proj_query("t_bk")
@@ -351,22 +339,8 @@ def test_backup_restore_flat():
     assert check_table("t_bk2") == "1"
 
 
-# Issue #11: on zero-copy storage, a mutation must keep blobs hardlinked by flat
-# projections. The mutation records hardlinked projection files in the zero-copy
-# keep-list; the removal of the source part filters that list by the logical
-# projection dir name ("p.proj/..."), so entries recorded under the physical
-# sibling name ("<part>.p.proj/...") never match and the shared blobs are deleted
-# from under the mutated part.
-#
-# The scenario needs two replicas: on the mutating replica the shared blobs are
-# protected by the local metadata hardlink ref-counts, so the keep-list only
-# decides the fate of the blobs on a replica that zero-copy-fetched the mutated
-# part (fresh metadata, ref-count 0) and is the last one to unlock the old part.
-# node1 executes the mutation (node2's queues are stopped), node2 fetches the
-# mutated part, node1 drops the table (releasing its locks), and node2's delayed
-# old-part cleanup then decides whether the shared projection blobs survive.
-# The mutation must not touch projection columns, otherwise the projection is
-# rebuilt instead of hardlinked.
+# On zero-copy storage a mutation must keep blobs hardlinked by flat projections: the removal filters the
+# keep-list by the logical dir name ("p.proj/..."), so entries under the physical name would mismatch and drop the blobs.
 def test_zero_copy_mutation_preserves_flat_projection():
     for n, replica in ((node, "1"), (node2, "2")):
         n.query("DROP TABLE IF EXISTS t_zc SYNC")
@@ -433,11 +407,8 @@ def plant_stale_tmp_dir(stale, n=node):
     )
 
 
-# Issue #1 (removeRecursive): when an insert reuses the temporary directory name of a
-# previously failed insert, the collision cleanup in MergeTreeDataWriter wipes the stale
-# tmp_insert_<part> dir via removeRecursive - the stale flat sibling must die with it.
-# Otherwise the fresh projection is written into the leftover sibling directory and its
-# stale files are published under the live part name.
+# When an insert reuses a failed insert's tmp dir, removeRecursive collision-cleanup must wipe the stale
+# flat sibling too; else the fresh projection is written into the leftover and published under the live part.
 # @pytest.mark.xfail(reason=REVIEW + "3544856348", strict=False)
 def test_stale_tmp_insert_sibling_removed():
     node.query("DROP TABLE IF EXISTS t_ins SYNC")
@@ -631,10 +602,8 @@ def test_unlisted_projection_warns():
     assert node.contains_in_log("loads projection p that is not referenced by its checksums.txt")
 
 
-# Regenerating a lost manifest must restore projection records: checkDataPart folds them
-# only from the loaded projection map, which is empty during the repair inside
-# loadChecksums, so the regenerated checksums.txt silently loses every projection and the
-# part fails CHECK TABLE forever after.
+# Regenerating a lost manifest must restore projection records: checkDataPart folds them only from the
+# loaded projection map (empty during the loadChecksums repair), silently dropping every projection.
 def test_repair_regenerates_projection_records():
     for tname, extra in (
         ("t_fix_nested", ""),
@@ -682,10 +651,8 @@ def test_publish_over_stale_detached_sibling():
     )
 
 
-# Issue #1 (removeSharedRecursive): a retried fetch finds the tmp-fetch_<part> dir of a
-# previously failed fetch and wipes it via removeSharedRecursive - the stale flat sibling
-# must die with it. Otherwise the retried download materializes the projection into the
-# leftover sibling directory, mixing stale files into the fetched part.
+# A retried fetch wipes the previous tmp-fetch_ dir via removeSharedRecursive; the stale flat sibling
+# must die with it, else the retried download mixes stale files into the fetched part.
 # @pytest.mark.xfail(reason=REVIEW + "3534142472", strict=False)
 def test_stale_tmp_fetch_sibling_removed():
     for n, replica in ((node, "1"), (node2, "2")):
@@ -720,10 +687,8 @@ def test_stale_tmp_fetch_sibling_removed():
     assert check_table("t_fetch", node2) == "1"
 
 
-# Ownership filter (MOVE PART): a flat sibling the part does not own (here: the part was
-# written with materialize_projections_on_insert = 0, so it has no projection at all) is
-# residue of a failed operation on a same-named part. A cross-disk move clones the part
-# via clonePart and must not copy the unowned sibling to the destination.
+# MOVE PART clones cross-disk via clonePart, which copies only the part's own projections (its cache,
+# seeded from the manifest), so an unowned residue sibling is structurally excluded - assert the outcome.
 # https://github.com/ClickHouse/ClickHouse/pull/108443#discussion_r3569019427
 def test_move_part_skips_unowned_sibling():
     node.query("DROP TABLE IF EXISTS t_move SYNC")
@@ -746,14 +711,12 @@ def test_move_part_skips_unowned_sibling():
     assert dst != src  # the part really moved
     assert not path_exists(f"{dst}.p.proj")
     assert not path_exists(f"{dst}/p.proj")
-    assert node.contains_in_log(f"Not cloning projection directory {name}.p.proj")
     assert active_projection_parts("t_move") == "0"
     assert node.query("SELECT count() FROM t_move").strip() == "1000"
 
 
-# Ownership filter (cross-disk ATTACH PARTITION FROM): the destination table lives on a
-# different disk, so cloneAndLoadDataPart takes the freezeRemote path - it must apply the
-# same owned-projections filter as the same-disk freeze path.
+# Cross-disk ATTACH PARTITION FROM takes the freezeRemote path; it must apply the same owned-projections
+# filter as the same-disk freeze path.
 # https://github.com/ClickHouse/ClickHouse/pull/108443#discussion_r3569019441
 def test_attach_from_cross_disk_skips_unowned_sibling():
     node.query("DROP TABLE IF EXISTS t_att_src SYNC")
@@ -780,10 +743,8 @@ def test_attach_from_cross_disk_skips_unowned_sibling():
     assert check_table("t_att_dst") == "1"
 
 
-# Ownership filter (mutation): the column-subset mutation path discovers projections from
-# disk; a sibling the source part's checksums do not reference must not be hardlinked into
-# the mutated part. The mutated column is not used by the projection, so an owned
-# projection would be hardlinked - the unowned one must be skipped instead.
+# The column-subset mutation discovers projections from disk; a sibling the source part's checksums do
+# not reference must not be hardlinked into the mutated part.
 def test_mutation_skips_unowned_sibling():
     node.query("DROP TABLE IF EXISTS t_mut SYNC")
     node.query("SYSTEM STOP MERGES")
@@ -810,10 +771,8 @@ def test_mutation_skips_unowned_sibling():
     assert node.query("SELECT count() FROM t_mut").strip() == "1000"
 
 
-# Manifest repair: regenerating a lost checksums.txt restores records only for projections
-# declared in the table metadata. An undeclared projection directory (here: q.proj, a valid
-# projection dir copied under a name the table never had) must not be legitimized by the
-# regenerated manifest.
+# Regenerating a lost checksums.txt restores records only for metadata-declared projections; an undeclared
+# projection dir (here q.proj) must not be legitimized by the regenerated manifest.
 def test_repair_skips_undeclared_projection_dir():
     setup_table("t_undecl", "projection_storage_format = 'flat'")
     baseline = proj_query("t_undecl")
@@ -848,9 +807,8 @@ def test_repair_skips_undeclared_projection_dir():
     )
 
 
-# Detached surface: after DETACH PART on a FLAT table, system.detached_parts must show one
-# entry (no junk row for the sibling) whose bytes_on_disk includes the sibling, and
-# DROP DETACHED PART must remove the sibling too.
+# After DETACH PART on a FLAT table, system.detached_parts shows one entry (no junk row for the sibling)
+# whose bytes_on_disk includes the sibling, and DROP DETACHED PART removes the sibling too.
 # https://github.com/ClickHouse/ClickHouse/pull/108443#discussion_r3569019447
 def test_detached_surface_flat_sibling():
     setup_table("t_det_surf", "projection_storage_format = 'flat'")

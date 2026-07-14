@@ -279,8 +279,7 @@ MergeTreePartsMover::TemporaryClonedPart MergeTreePartsMover::clonePart(const Me
                 read_settings,
                 write_settings,
                 log,
-                cancellation_hook,
-                part->getOwnedProjectionDirectoryNames());
+                cancellation_hook);
         }
     }
     else

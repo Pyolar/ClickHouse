@@ -7641,13 +7641,12 @@ MergeTreeData::PartsBackupEntries MergeTreeData::backupParts(
             backup_entries_from_part,
             &temp_dirs,
             /*is_projection_part=*/ false,
-            /*allow_backup_broken_projection=*/ false,
-            /*part_dir_in_backup=*/ {});
+            /*allow_backup_broken_projection=*/ false);
 
         auto backup_projection = [&](IDataPartStorage & storage, IMergeTreeDataPart & projection_part)
         {
-            /// Serialize the projection under its logical name, so the backup layout
-            /// does not depend on the on-disk projection layout.
+            /// The projection storage backs up under its logical name ("<name>.proj") itself (see
+            /// IDataPartStorage::backup), so the backup layout is independent of the on-disk layout.
             storage.backup(
                 projection_part.checksums,
                 projection_part.getFileNamesWithoutChecksums(),
@@ -7657,8 +7656,7 @@ MergeTreeData::PartsBackupEntries MergeTreeData::backupParts(
                 backup_entries_from_part,
                 &temp_dirs,
                 projection_part.is_broken,
-                backup_settings.allow_backup_broken_projections,
-                projection_part.name + ".proj");
+                backup_settings.allow_backup_broken_projections);
         };
 
         auto projection_parts = part->getProjectionParts();
@@ -10043,9 +10041,8 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> MergeTreeData::cloneAn
     if (params.copy_instead_of_hardlink)
         with_copy = " (copying data)";
 
-    IDataPartStorage::ClonePartParams params_with_projections = params;
-    params_with_projections.projections_to_copy = src_part->getOwnedProjectionDirectoryNames();
-
+    /// freeze/freezeRemote copy the owned FLAT projection siblings themselves (from the source
+    /// storage's projection cache); no owned-set needs to be threaded through params.
     std::shared_ptr<IDataPartStorage> dst_part_storage{};
     if (on_same_disk)
     {
@@ -10055,7 +10052,7 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> MergeTreeData::cloneAn
             read_settings,
             write_settings,
             /* save_metadata_callback= */ {},
-            params_with_projections);
+            params);
     }
     else
     {
@@ -10072,7 +10069,7 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> MergeTreeData::cloneAn
             read_settings,
             write_settings,
             /* save_metadata_callback= */ {},
-            params_with_projections);
+            params);
     }
 
     if (params.metadata_version_to_write.has_value())
@@ -10342,7 +10339,6 @@ PartitionCommandsResultInfo MergeTreeData::freezePartitionsByMatcher(
                 {
                     .make_source_readonly = true
                 };
-                params.projections_to_copy = part->getOwnedProjectionDirectoryNames();
 
                 auto new_storage = data_part_storage->freeze(
                     backup_part_path,
