@@ -183,8 +183,11 @@ private:
             /// Raw header value stored at push time; parsed against the current column
             /// type at flush time so schema drift is handled naturally without any
             /// explicit drift detection or round-trip re-serialization.
-            struct HTTPHeaderColumnValue { String col_name; String raw_value; };
-            std::vector<HTTPHeaderColumnValue> http_header_column_values;
+            /// Raw HTTP header values for the injected columns, positionally aligned
+            /// to InsertQuery::http_header_column_names (both sorted by column name at
+            /// push time). The injected column set is part of the batch key, so it is
+            /// the same for every entry in a batch and need not be stored per entry.
+            std::vector<String> http_header_column_values;
 
             Entry(
                 DataChunk && chunk_,
