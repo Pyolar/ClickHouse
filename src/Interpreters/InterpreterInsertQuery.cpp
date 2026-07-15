@@ -649,6 +649,22 @@ QueryPipeline InterpreterInsertQuery::buildInsertSelectPipeline(ASTInsertQuery &
     /// resizes to 1 stream regardless.
     select_query_sorted = queryHasOrderByAll(query.select) && pipeline.getNumStreams() <= 1;
 
+    /// If http_column_* params are active, inject a transform that appends the
+    /// header-backed columns to each chunk produced by the SELECT. The SELECT
+    /// output is the body-only block; the full pipeline header (body + injected)
+    /// was already set up by expandInsertQueryWithHTTPHeaderColumns above.
+    const auto & http_header_columns = select_context->getHTTPHeaderColumns();
+    if (!http_header_columns.empty())
+    {
+        auto metadata_snapshot = table->getInMemoryMetadataPtr(select_context, false);
+        const Block full_header = getSampleBlock(query, table, metadata_snapshot, select_context);
+        pipeline.addSimpleTransform([&](const SharedHeader & header) -> ProcessorPtr
+        {
+            return std::make_shared<HTTPHeaderColumnsTransform>(
+                *header, full_header, http_header_columns, getFormatSettings(select_context));
+        });
+    }
+
     return addInsertToSelectPipeline(query, table, pipeline);
 }
 
@@ -1150,13 +1166,16 @@ BlockIO InterpreterInsertQuery::execute()
     const auto & http_header_columns = context->getHTTPHeaderColumns();
     if (!http_header_columns.empty())
     {
-        /// http_column_* is only supported for pure FORMAT inserts.
-        /// INSERT ... SELECT already has getClientHTTPHeader for reading headers.
-        if (query.select)
+        /// INSERT ... SELECT with an implicit column list is not supported: the
+        /// null-columns expansion iterates the table schema to derive body columns,
+        /// but for SELECT the body columns are the SELECT output which is unknown
+        /// at this point. Require an explicit column list so the SELECT output can
+        /// be matched unambiguously.
+        if (query.select && !query.columns)
             throw Exception(
                 ErrorCodes::NOT_IMPLEMENTED,
-                "http_column_* URL parameters are not supported with INSERT ... SELECT. "
-                "Use getClientHTTPHeader() in the SELECT clause instead");
+                "http_column_* URL parameters with INSERT ... SELECT require an explicit "
+                "column list, e.g. INSERT INTO t (payload) SELECT ... ");
 
         expandInsertQueryWithHTTPHeaderColumns(query, metadata_snapshot, http_header_columns, allow_materialized);
     }

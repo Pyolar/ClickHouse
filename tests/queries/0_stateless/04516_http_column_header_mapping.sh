@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Tags: no-fasttest
 # Test http_column_* URL params: map HTTP request headers to INSERT columns.
 # Works for both sync and async inserts.
 
@@ -165,11 +164,19 @@ do_basic_tests() {
         "${CLICKHOUSE_URL}${INSERT_EXTRA}&query=INSERT+INTO+typed+(payload)+FORMAT+JSONEachRow&http_column_X-Count=count" \
         -d '{"payload":"type-err"}' 2>&1 | expect_match 'CANNOT_PARSE_TEXT|Cannot parse'
 
-    echo "--- ${mode}: INSERT ... SELECT rejected"
+    echo "--- ${mode}: INSERT ... SELECT without explicit column list is rejected"
     ${CLICKHOUSE_CURL} -sS \
         -H 'X-Event-Type: push' \
-        "${CLICKHOUSE_URL}${INSERT_EXTRA}&query=INSERT+INTO+t+(payload)+SELECT+%27x%27&http_column_X-Event-Type=event_type" \
+        "${CLICKHOUSE_URL}${INSERT_EXTRA}&query=INSERT+INTO+t+SELECT+%27x%27+AS+payload&http_column_X-Event-Type=event_type" \
         2>&1 | expect_match 'NOT_IMPLEMENTED'
+
+    echo "--- ${mode}: INSERT ... SELECT with explicit column list"
+    ${CLICKHOUSE_CURL} -sS \
+        -H 'X-Event-Type: select-push' \
+        "${CLICKHOUSE_URL}${INSERT_EXTRA}&query=INSERT+INTO+t+(payload)+SELECT+'select-payload'&http_column_X-Event-Type=event_type"
+    flush
+    ${CLICKHOUSE_CLIENT} -q "SELECT event_type, payload FROM t WHERE event_type='select-push'"
+    ${CLICKHOUSE_CLIENT} -q "TRUNCATE TABLE t"
 }
 
 # ── Typed table (for type-error test) ─────────────────────────────────────────

@@ -353,7 +353,15 @@ aborting the other entries in the batch, and (with `wait_for_async_insert=1`) th
 receives that error.
 
 <Note>
-The `http_column_` parameters only affect `INSERT` queries. For `SELECT` queries they are ignored.
+The `http_column_` parameters only affect `INSERT` queries. For standalone `SELECT` queries they are ignored.
+`INSERT ... SELECT` is supported, but requires an explicit column list so ClickHouse knows which
+columns the `SELECT` output provides and which come from headers:
+
+```bash
+$ curl -sS -H 'X-Event-Type: push' \
+    'http://localhost:8123/?query=INSERT+INTO+events+(payload)+SELECT+payload+FROM+src&http_column_X-Event-Type=event_type'
+```
+
 Header values come from the same filtered request-header set that the
 [`getClientHTTPHeader`](/sql-reference/functions/other-functions#getClientHTTPHeader) function reads,
 so restricted headers such as `Authorization` and `X-ClickHouse-*` are stripped and cannot be mapped.

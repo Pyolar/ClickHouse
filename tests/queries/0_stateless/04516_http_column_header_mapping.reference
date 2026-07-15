@@ -24,8 +24,10 @@ body-value2	empty-col
 first	dup
 --- sync: type parse error surfaces immediately
 Cannot parse
---- sync: INSERT ... SELECT rejected
+--- sync: INSERT ... SELECT without explicit column list is rejected
 NOT_IMPLEMENTED
+--- sync: INSERT ... SELECT with explicit column list
+select-push	select-payload
 --- async: no explicit column list (body provides remaining columns)
 push	s	no-list
 --- async: no explicit column list, body also contains a header-mapped field is an error
@@ -52,8 +54,10 @@ body-value2	empty-col
 first	dup
 --- async: type parse error surfaces immediately
 Cannot parse
---- async: INSERT ... SELECT rejected
+--- async: INSERT ... SELECT without explicit column list is rejected
 NOT_IMPLEMENTED
+--- async: INSERT ... SELECT with explicit column list
+select-push	select-payload
 --- async: different header values per request coalesce into one batch
 push	sig1	batch1
 release	sig2	batch2
