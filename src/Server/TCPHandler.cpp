@@ -2483,7 +2483,8 @@ void TCPHandler::processQuery(std::shared_ptr<QueryState> & state)
     state->compression = static_cast<Protocol::Compression>(compression);
     last_block_in.compression = state->compression;
 
-    readStringBinary(state->query, *in);
+    const size_t max_query_size = query_context->getSettingsRef()[Setting::max_query_size];
+    readStringBinary(state->query, *in, max_query_size);
 
     Settings passed_params;
     if (client_tcp_protocol_version >= DBMS_MIN_PROTOCOL_VERSION_WITH_PARAMETERS)
